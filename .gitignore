@@ -1,0 +1,15 @@
+# Built add-ons and local test binaries
+*.addon64
+*.exe
+
+# Capture output and local visual inspection material
+*.png
+*.log
+FABLE5_TRANSPARENCY_PROMPT.md
+
+# Editor and OS metadata
+.vs/
+.vscode/
+*.user
+Thumbs.db
+Desktop.ini
