@@ -62,6 +62,7 @@ test('capture filenames use a configurable ReShade-style token template', () => 
   assert.match(source, /sanitize_capture_file_name/)
   assert.match(source, /save_file_naming/)
   assert.match(source, /Screenshot filename|截图文件名/)
+  assert.match(source, /sprintf_s\(date, "%04u-%02u-%02u"/)
   assert.match(source, /const std::wstring black_path = prefix \+ L"_Black\.png"/)
   assert.match(source, /const std::wstring white_path = prefix \+ L"_White\.png"/)
   assert.match(source, /const std::wstring final_path = prefix \+ L"_Final\.png"/)

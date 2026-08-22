@@ -1277,7 +1277,8 @@ std::string expand_file_naming(const std::string &pattern, const SYSTEMTIME &now
 	char minute[4] = {};
 	char second[4] = {};
 	char milliseconds[8] = {};
-	sprintf_s(date, "%04u%02u%02u", now.wYear, now.wMonth, now.wDay);
+	// Match ReShade's %Date% expansion: ISO date with hyphens.
+	sprintf_s(date, "%04u-%02u-%02u", now.wYear, now.wMonth, now.wDay);
 	sprintf_s(hour, "%02u", now.wHour);
 	sprintf_s(minute, "%02u", now.wMinute);
 	sprintf_s(second, "%02u", now.wSecond);
