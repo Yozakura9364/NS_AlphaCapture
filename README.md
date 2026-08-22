@@ -24,7 +24,7 @@
 20260818-120000-000_000001_final.png
 ```
 
-`Ctrl+Shift+F9` 会重新读取热键、`OutputDirectory` 和输出选择。`OutputDirectory=` 为空时，首次载入会继承 `ReShade.ini` 或 `GShade.ini` 的 `[SCREENSHOT] SavePath`；两者都没有有效设置时使用 Windows“图片”目录。设置面板可以直接编辑并保存截图路径，也可以一键恢复使用 ReShade/GShade 路径。输出选择会立即写入 `OutputBlack`、`OutputWhite`、`OutputTransparent`，至少要保留一种。日志也保存在输出目录的 `NS_AlphaCapture.log`，会记录捕获武装、目标 hash、RT 创建、indexed/non-indexed draw 数、主 RT clear 数、像素覆盖统计和失败原因。
+`Ctrl+Shift+F9` 会重新读取热键、`OutputDirectory` 和输出选择。`OutputDirectory=` 为空时，首次载入会继承 `ReShade.ini` 或 `GShade.ini` 的 `[SCREENSHOT] SavePath`；两者都没有有效设置时使用 Windows“图片”目录。设置面板可以直接编辑并保存截图路径，也可以一键恢复使用 ReShade/GShade 路径。输出选择会立即写入 `OutputBlack`、`OutputWhite`、`OutputTransparent`，至少要保留一种。日志固定保存在 addon 所在目录的 `NS_AlphaCapture.log`（与 `NS_AlphaCapture.addon64` 同目录），不会写入用户截图输出目录；会记录捕获武装、目标 hash、RT 创建、indexed/non-indexed draw 数、主 RT clear 数、像素覆盖统计和失败原因。
 
 ### 自动网格匹配
 

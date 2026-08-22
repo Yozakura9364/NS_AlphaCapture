@@ -205,7 +205,7 @@ struct state {
 	uint32_t replay_nonindexed_draw_count = 0;
 	uint32_t replay_clear_count = 0;
 	uint64_t replay_frame_target_resource = 0;
-	uint64_t learned_scene_target_resource = 0;
+	std::vector<ComPtr<ID3D11Resource>> learned_scene_targets;
 	bool locale_zh = false;
 	int hotkey_capture_target = 0;
 	uint32_t hotkey_suppress_key = 0;
@@ -217,6 +217,7 @@ thread_local uint32_t g_replay_depth = 0;
 
 bool shader_contains_discard(const void *code, size_t code_size);
 bool capture_failure(const std::string &detail);
+bool current_render_target_is_learned(ID3D11DeviceContext *context);
 
 uint64_t command_key(command_list *cmd_list) {
 	return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cmd_list));
@@ -701,6 +702,8 @@ bool build_paths() {
 	const size_t separator = base.find_last_of(L"\\/");
 	base = separator == std::wstring::npos ? L"." : base.substr(0, separator);
 	g.config_path = base + L"\\NS_AlphaCapture.ini";
+	// Keep diagnostics beside the addon binary, separate from user capture files.
+	g.log_path = base + L"\\NS_AlphaCapture.log";
 	const size_t parent_separator = base.find_last_of(L"\\/");
 	const std::wstring parent = parent_separator == std::wstring::npos ? L"" : base.substr(0, parent_separator);
 	const std::array<std::wstring, 2> directories = { base, parent };
@@ -734,7 +737,6 @@ bool build_paths() {
 	if (g.default_output_dir.empty())
 		g.default_output_dir = base;
 	g.output_dir = g.default_output_dir;
-	g.log_path = g.output_dir + L"\\NS_AlphaCapture.log";
 	return true;
 }
 
@@ -857,7 +859,6 @@ bool load_config() {
 	}
 
 	g.output_dir = output_directory;
-	g.log_path = g.output_dir + L"\\NS_AlphaCapture.log";
 	g.rule_groups = std::move(fresh_rule_groups);
 	g.nonindexed_rules = std::move(fresh_nonindexed_rules);
 	g.group_editor_index = -1;
@@ -898,12 +899,9 @@ bool save_output_directory(const std::string &configured_value) {
 	}
 
 	const std::wstring previous_output = g.output_dir;
-	const std::wstring previous_log = g.log_path;
 	g.output_dir = resolved;
-	g.log_path = g.output_dir + L"\\NS_AlphaCapture.log";
 	if (!ensure_output_directory()) {
 		g.output_dir = previous_output;
-		g.log_path = previous_log;
 		capture_failure(text("cannot create screenshot directory", "无法创建截图目录"));
 		return false;
 	}
@@ -911,7 +909,6 @@ bool save_output_directory(const std::string &configured_value) {
 	FILE *file = nullptr;
 	if (_wfopen_s(&file, g.config_path.c_str(), L"rb") != 0 || file == nullptr) {
 		g.output_dir = previous_output;
-		g.log_path = previous_log;
 		capture_failure(text("cannot open addon configuration", "无法打开 addon 配置"));
 		return false;
 	}
@@ -924,7 +921,6 @@ bool save_output_directory(const std::string &configured_value) {
 	if (!read_ok || !replace_ini_value(content, "OutputDirectory", value) ||
 		_wfopen_s(&file, g.config_path.c_str(), L"wb") != 0 || file == nullptr) {
 		g.output_dir = previous_output;
-		g.log_path = previous_log;
 		capture_failure(text("cannot save screenshot path", "无法保存截图路径"));
 		return false;
 	}
@@ -932,7 +928,6 @@ bool save_output_directory(const std::string &configured_value) {
 	fclose(file);
 	if (!write_ok) {
 		g.output_dir = previous_output;
-		g.log_path = previous_log;
 		capture_failure(text("cannot save screenshot path", "无法保存截图路径"));
 		return false;
 	}
@@ -1299,11 +1294,10 @@ bool ensure_replay_resources(ID3D11DeviceContext *context,
 
 	D3D11_TEXTURE2D_DESC original_desc = {};
 	original_texture->GetDesc(&original_desc);
-	if (original_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
-		original_desc.Width == 0 || original_desc.Height == 0 ||
+	if (original_desc.Width == 0 || original_desc.Height == 0 ||
 		original_desc.MipLevels != 1 || original_desc.ArraySize != 1 ||
 		original_desc.SampleDesc.Count != 1) {
-		error = "target RT is not single-sample R16G16B16A16_FLOAT Texture2D";
+		error = "target RT is not a single-sample Texture2D";
 		return false;
 	}
 
@@ -1511,7 +1505,7 @@ bool mirror_scene_draw(command_list *cmd_list, uint32_t index_count,
 	context->OMGetRenderTargets(static_cast<UINT>(original_rtvs.size()), original_rtvs.data(), &original_dsv);
 	const uint64_t target_id = render_target_resource_id(original_rtvs[0]);
 	if (original_rtvs[0] == nullptr || original_dsv == nullptr ||
-		target_id == 0 || target_id != g.learned_scene_target_resource) {
+		target_id == 0 || !current_render_target_is_learned(context)) {
 		for (ID3D11RenderTargetView *rtv : original_rtvs) if (rtv != nullptr) rtv->Release();
 		if (original_dsv != nullptr) original_dsv->Release();
 		return false;
@@ -2381,6 +2375,45 @@ uint64_t current_render_target_resource_id(ID3D11DeviceContext *context) {
 	return result;
 }
 
+bool current_render_target_is_learned(ID3D11DeviceContext *context) {
+	if (context == nullptr || g.learned_scene_targets.empty())
+		return false;
+	ID3D11RenderTargetView *rtv = nullptr;
+	context->OMGetRenderTargets(1, &rtv, nullptr);
+	ComPtr<ID3D11Resource> resource;
+	if (rtv != nullptr)
+		rtv->GetResource(&resource);
+	if (rtv != nullptr)
+		rtv->Release();
+	if (resource == nullptr)
+		return false;
+	for (const ComPtr<ID3D11Resource> &learned : g.learned_scene_targets) {
+		if (learned.Get() == resource.Get())
+			return true;
+	}
+	return false;
+}
+
+void remember_current_render_target(ID3D11DeviceContext *context) {
+	if (context == nullptr)
+		return;
+	ID3D11RenderTargetView *rtv = nullptr;
+	context->OMGetRenderTargets(1, &rtv, nullptr);
+	ComPtr<ID3D11Resource> resource;
+	if (rtv != nullptr)
+		rtv->GetResource(&resource);
+	if (rtv != nullptr)
+		rtv->Release();
+	if (resource == nullptr)
+		return;
+	for (const ComPtr<ID3D11Resource> &learned : g.learned_scene_targets) {
+		if (learned.Get() == resource.Get())
+			return;
+	}
+	if (g.learned_scene_targets.size() < 64)
+		g.learned_scene_targets.push_back(std::move(resource));
+}
+
 void record_shader_candidate(ID3D11DeviceContext *context, const shader_hashes &hashes,
 	const draw_arguments &arguments) {
 	if (!g.shader_selector_active || context == nullptr)
@@ -2533,8 +2566,7 @@ bool on_draw_indexed(command_list *cmd_list, uint32_t index_count, uint32_t inst
 	}
 	if (g.replay_capture_active && is_configured_shader_rule(hashes, index_count, first_index,
 		vertex_offset) &&
-		g.learned_scene_target_resource != 0 &&
-		current_render_target_resource_id(context) == g.learned_scene_target_resource)
+		current_render_target_is_learned(context))
 		return replay_color_draw(cmd_list, index_count, instance_count, first_index,
 			vertex_offset, first_instance, hashes.pixel, false);
 	if (g.cfg.auto_match) {
@@ -2548,7 +2580,7 @@ bool on_draw_indexed(command_list *cmd_list, uint32_t index_count, uint32_t inst
 			if (query_runtime_dither_state(context, arguments, mesh)) {
 				const uint64_t scene_target = current_render_target_resource_id(context);
 				if (scene_target != 0)
-					g.learned_scene_target_resource = scene_target;
+					remember_current_render_target(context);
 				bool inserted = false;
 				{
 					std::lock_guard<std::mutex> lock(g.pipeline_mutex);
@@ -2556,10 +2588,21 @@ bool on_draw_indexed(command_list *cmd_list, uint32_t index_count, uint32_t inst
 						inserted = g.learned_meshes.insert(mesh).second;
 				}
 				if (inserted)
-					log_line("auto_match learned dither mesh ib=0x%llX first=%u count=%u vb0=0x%llX",
+					log_line("auto_match learned dither mesh ib=0x%llX first=%u count=%u vb0=0x%llX target=0x%llX",
 						static_cast<unsigned long long>(mesh.index_buffer), mesh.first_index,
-						mesh.index_count, static_cast<unsigned long long>(mesh.vertex_buffer0));
-				return false;
+						mesh.index_count, static_cast<unsigned long long>(mesh.vertex_buffer0),
+						static_cast<unsigned long long>(scene_target));
+					if (g.replay_capture_active) {
+						bool additive = false;
+						if (query_color_replay_state(context, mesh, additive)) {
+							return replay_color_draw(cmd_list, index_count, instance_count, first_index,
+								vertex_offset, first_instance, hashes.pixel, false);
+						}
+						if (mirror_scene_draw(cmd_list, index_count, instance_count, first_index,
+							vertex_offset, first_instance))
+							return true;
+					}
+					return false;
 			}
 		}
 		if (!g.replay_capture_active)
@@ -2620,7 +2663,7 @@ bool on_draw(command_list *cmd_list, uint32_t vertex_count, uint32_t instance_co
 		if (dsv != nullptr) dsv->Release();
 		return replayed;
 	}
-	if (current_render_target_resource_id(context) == g.learned_scene_target_resource)
+	if (current_render_target_is_learned(context))
 		++g.replay_nonindexed_draw_count;
 	if (blend != nullptr) blend->Release();
 	if (rtv != nullptr) rtv->Release();
@@ -3457,6 +3500,7 @@ void on_settings_overlay(effect_runtime *runtime) {
 void on_destroy_device(device *) {
 	g.replay_capture_active = false;
 	reset_replay_frame_state();
+	g.learned_scene_targets.clear();
 	g.replay = {};
 }
 

@@ -22,7 +22,8 @@ test('capture output and runtime log are routed outside the game directory', () 
   assert.match(source, /_wfopen_s\([^\n]*g\.config_path\.c_str\(\), L"rb"\)/)
   assert.match(source, /MultiByteToWideChar\(CP_UTF8, MB_ERR_INVALID_CHARS/)
   assert.doesNotMatch(source, /GetPrivateProfileString[AW]/)
-  assert.match(source, /g\.log_path = g\.output_dir \+ L"\\\\NS_AlphaCapture\.log"/)
+  assert.match(source, /g\.log_path = base \+ L"\\\\NS_AlphaCapture\.log"/)
+  assert.doesNotMatch(source, /g\.log_path = g\.output_dir \+ L"\\\\NS_AlphaCapture\.log"/)
 })
 
 test('output selection defaults to transparent only and controls only disk exports', () => {
@@ -451,7 +452,7 @@ test('color replay tracks shader hashes and targets only captured mesh signature
 test('color replay uses the original DSV with compatible private black and white RGBA32F targets', () => {
   const source = read('./NS_AlphaCapture.cpp')
 
-  assert.match(source, /original_desc\.Format\s*!=\s*DXGI_FORMAT_R16G16B16A16_FLOAT/)
+  assert.match(source, /original_desc\.SampleDesc\.Count\s*!=\s*1/)
   assert.match(source, /original_desc\.SampleDesc\.Count\s*!=\s*1/)
   assert.match(source, /depth_desc\.SampleDesc\.Count\s*!=\s*1/)
   assert.match(source, /capture_desc\.Format\s*=\s*DXGI_FORMAT_R32G32B32A32_FLOAT/)
@@ -464,6 +465,16 @@ test('color replay uses the original DSV with compatible private black and white
   assert.doesNotMatch(source, /depth_texture/)
   assert.doesNotMatch(source, /depth_dsv/)
   assert.doesNotMatch(source, /ClearDepthStencilView/)
+})
+
+test('auto-match replays newly learned scene draws during the capture frame', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+
+  assert.match(source, /remember_current_render_target\(context\)/)
+  assert.match(source, /current_render_target_is_learned\(context\)/)
+  assert.match(source, /if \(g\.replay_capture_active\) \{[^]*query_color_replay_state\(context, mesh, additive\)/s)
+  assert.match(source, /target RT is not a single-sample Texture2D/)
+  assert.doesNotMatch(source, /target RT is not single-sample R16G16B16A16_FLOAT Texture2D/)
 })
 
 test('color replay preserves opaque occlusion with read-only depth and stencil', () => {
@@ -481,7 +492,8 @@ test('capture mirrors ordinary indexed scene draws into both real backgrounds', 
   const source = read('./NS_AlphaCapture.cpp')
   const mirror = source.match(/bool mirror_scene_draw\([^]*?\n\}/)?.[0] ?? ''
 
-  assert.match(source, /learned_scene_target_resource/)
+  assert.match(source, /learned_scene_targets/)
+  assert.match(source, /current_render_target_is_learned/)
   assert.match(source, /current_render_target_resource_id/)
   assert.match(mirror, /g\.replay\.black_rtv/)
   assert.match(mirror, /g\.replay\.white_rtv/)
