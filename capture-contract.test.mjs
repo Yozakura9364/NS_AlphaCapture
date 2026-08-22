@@ -52,6 +52,23 @@ test('output selection defaults to transparent only and controls only disk expor
   assert.doesNotMatch(replayExport, /_rgba\.png|_alpha\.png|_rgba32f\.bin|_lens_/)
 })
 
+test('capture filenames use a configurable ReShade-style token template', () => {
+  const config = read('./NS_AlphaCapture.ini')
+  const source = read('./NS_AlphaCapture.cpp')
+
+  assert.match(config, /^FileNaming=%Date%_%TimeHour%-%TimeMinute%-%TimeSecond%-%TimeMS%$/m)
+  assert.match(source, /default_file_naming/)
+  assert.match(source, /expand_file_naming/)
+  assert.match(source, /sanitize_capture_file_name/)
+  assert.match(source, /save_file_naming/)
+  assert.match(source, /Screenshot filename|截图文件名/)
+  assert.match(source, /const std::wstring black_path = prefix \+ L"_Black\.png"/)
+  assert.match(source, /const std::wstring white_path = prefix \+ L"_White\.png"/)
+  assert.match(source, /const std::wstring final_path = prefix \+ L"_Final\.png"/)
+  for (const token of ['%Date%', '%TimeHour%', '%TimeMinute%', '%TimeSecond%', '%TimeMS%'])
+    assert.match(source, new RegExp(token.replaceAll('%', '\\%')))
+})
+
 test('capture is armed for exactly the next frame instead of replaying every frame', () => {
   const source = read('./NS_AlphaCapture.cpp')
   const drawCallback = source.match(/bool on_draw_indexed\([^]*?\n\}/)?.[0] ?? ''
@@ -259,7 +276,7 @@ test('addon exports its own synchronized RGBA reconstruction without requiring F
   const source = read('./NS_AlphaCapture.cpp')
 
   assert.match(source, /const rgba_image &final_rgba = rgba/)
-  assert.match(source, /_final\.png/)
+  assert.match(source, /_Final\.png/)
   assert.match(source, /capture pixels: black_nonzero=/)
 })
 

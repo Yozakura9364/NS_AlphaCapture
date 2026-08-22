@@ -39,6 +39,9 @@ using namespace reshade::api;
 
 namespace {
 
+constexpr const char *default_file_naming =
+	"%Date%_%TimeHour%-%TimeMinute%-%TimeSecond%-%TimeMS%";
+
 struct shader_rule {
 	uint32_t pixel = 0;
 	uint32_t vertex = 0;
@@ -55,6 +58,7 @@ struct config {
 	bool output_black = false;
 	bool output_white = false;
 	bool output_transparent = true;
+	std::string file_naming = default_file_naming;
 	bool auto_match = true;
 	bool lens_only = false;
 	bool lens_capture = true;
@@ -210,6 +214,7 @@ struct state {
 	int hotkey_capture_target = 0;
 	uint32_t hotkey_suppress_key = 0;
 	std::array<char, 1024> output_path_input = {};
+	std::array<char, 512> file_naming_input = {};
 };
 
 state g;
@@ -218,6 +223,7 @@ thread_local uint32_t g_replay_depth = 0;
 bool shader_contains_discard(const void *code, size_t code_size);
 bool capture_failure(const std::string &detail);
 bool current_render_target_is_learned(ID3D11DeviceContext *context);
+void sync_file_naming_input();
 
 uint64_t command_key(command_list *cmd_list) {
 	return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cmd_list));
@@ -491,6 +497,34 @@ bool save_output_selection(bool output_black, bool output_white, bool output_tra
 	return write_ok;
 }
 
+std::string trim_ascii(const std::string &value);
+
+bool save_file_naming(const std::string &configured_value) {
+	const std::string value = trim_ascii(configured_value);
+	if (value.empty() || value.size() >= 512 || value.find_first_of("\r\n") != std::string::npos)
+		return false;
+	FILE *file = nullptr;
+	if (_wfopen_s(&file, g.config_path.c_str(), L"rb") != 0 || file == nullptr)
+		return false;
+	fseek(file, 0, SEEK_END);
+	const long length = ftell(file);
+	fseek(file, 0, SEEK_SET);
+	std::string content(length > 0 ? static_cast<size_t>(length) : 0, '\0');
+	const bool read_ok = content.empty() || fread(content.data(), 1, content.size(), file) == content.size();
+	fclose(file);
+	if (!read_ok || !set_capture_ini_value(content, "FileNaming", value))
+		return false;
+	if (_wfopen_s(&file, g.config_path.c_str(), L"wb") != 0 || file == nullptr)
+		return false;
+	const bool write_ok = fwrite(content.data(), 1, content.size(), file) == content.size();
+	fclose(file);
+	if (!write_ok)
+		return false;
+	g.cfg.file_naming = value;
+	sync_file_naming_input();
+	return true;
+}
+
 std::string trim_ascii(const std::string &value) {
 	const size_t first = value.find_first_not_of(" \t");
 	if (first == std::string::npos)
@@ -579,6 +613,12 @@ void sync_output_path_input() {
 	const size_t length = std::min(output_path.size(), g.output_path_input.size() - 1);
 	memcpy(g.output_path_input.data(), output_path.data(), length);
 	g.output_path_input[length] = '\0';
+}
+
+void sync_file_naming_input() {
+	const size_t length = std::min(g.cfg.file_naming.size(), g.file_naming_input.size() - 1);
+	memcpy(g.file_naming_input.data(), g.cfg.file_naming.data(), length);
+	g.file_naming_input[length] = '\0';
 }
 
 bool read_utf8_capture_config(std::vector<std::pair<std::string, std::string>> &entries,
@@ -775,6 +815,11 @@ bool load_config() {
 	read_bool("OutputBlack", fresh.output_black);
 	read_bool("OutputWhite", fresh.output_white);
 	read_bool("OutputTransparent", fresh.output_transparent);
+	if (const std::string *file_naming_value = find_config_value(entries, "FileNaming")) {
+		const std::string trimmed = trim_ascii(*file_naming_value);
+		if (!trimmed.empty() && trimmed.find_first_of("\r\n") == std::string::npos)
+			fresh.file_naming = trimmed;
+	}
 	if (!fresh.output_black && !fresh.output_white && !fresh.output_transparent)
 		fresh.output_transparent = true;
 	if (const std::string *auto_match_value = find_config_value(entries, "AutoMatch"))
@@ -867,6 +912,7 @@ bool load_config() {
 	g.config_loaded = true;
 	g.config_error.clear();
 	sync_output_path_input();
+	sync_file_naming_input();
 	return true;
 }
 
@@ -1225,15 +1271,60 @@ bool save_texture_png(const std::wstring &path, const rgba_image &image, std::st
 	return true;
 }
 
+std::string expand_file_naming(const std::string &pattern, const SYSTEMTIME &now) {
+	char date[16] = {};
+	char hour[4] = {};
+	char minute[4] = {};
+	char second[4] = {};
+	char milliseconds[8] = {};
+	sprintf_s(date, "%04u%02u%02u", now.wYear, now.wMonth, now.wDay);
+	sprintf_s(hour, "%02u", now.wHour);
+	sprintf_s(minute, "%02u", now.wMinute);
+	sprintf_s(second, "%02u", now.wSecond);
+	sprintf_s(milliseconds, "%03u", now.wMilliseconds);
+	std::string expanded = pattern.empty() ? default_file_naming : pattern;
+	const std::array<std::pair<const char *, const char *>, 5> tokens = {{
+		{ "%Date%", date },
+		{ "%TimeHour%", hour },
+		{ "%TimeMinute%", minute },
+		{ "%TimeSecond%", second },
+		{ "%TimeMS%", milliseconds },
+	}};
+	for (const auto &[token, value] : tokens) {
+		for (size_t position = expanded.find(token); position != std::string::npos;
+			position = expanded.find(token, position + strlen(value))) {
+			expanded.replace(position, strlen(token), value);
+		}
+	}
+	return expanded;
+}
+
+std::wstring sanitize_capture_file_name(const std::wstring &value) {
+	std::wstring sanitized;
+	sanitized.reserve(value.size());
+	for (const wchar_t character : value) {
+		const bool invalid = character < 0x20 || character == L'<' || character == L'>' ||
+			character == L':' || character == L'"' || character == L'/' || character == L'\\' ||
+			character == L'|' || character == L'?' || character == L'*';
+		sanitized.push_back(invalid ? L'_' : character);
+	}
+	while (!sanitized.empty() && (sanitized.back() == L'.' || sanitized.back() == L' '))
+		sanitized.pop_back();
+	if (sanitized.empty() || sanitized == L"." || sanitized == L"..")
+		sanitized = L"capture";
+	if (sanitized.size() > 180)
+		sanitized.resize(180);
+	return sanitized;
+}
+
 std::wstring make_capture_prefix() {
 	SYSTEMTIME now = {};
 	GetLocalTime(&now);
-	const uint64_t serial = ++g.capture_serial;
-	wchar_t name[96] = {};
-	swprintf_s(name, L"%04u%02u%02u-%02u%02u%02u-%03u_%06llu",
-		now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond,
-		now.wMilliseconds, static_cast<unsigned long long>(serial));
-	return g.output_dir + L"\\" + name;
+	++g.capture_serial;
+	std::wstring file_name;
+	if (!utf8_to_wide(expand_file_naming(g.cfg.file_naming, now), file_name))
+		file_name = L"capture";
+	return g.output_dir + L"\\" + sanitize_capture_file_name(file_name);
 }
 
 bool make_replay_blend_states(ID3D11Device *device, replay_resources &resources,
@@ -2131,9 +2222,9 @@ bool capture_replay_outputs(effect_runtime *) {
 	const rgba_image white_rgba = make_display_image(white_raw);
 	const rgba_image &final_rgba = rgba;
 	const std::wstring prefix = make_capture_prefix();
-	const std::wstring black_path = prefix + L"_black.png";
-	const std::wstring white_path = prefix + L"_white.png";
-	const std::wstring final_path = prefix + L"_final.png";
+	const std::wstring black_path = prefix + L"_Black.png";
+	const std::wstring white_path = prefix + L"_White.png";
+	const std::wstring final_path = prefix + L"_Final.png";
 	bool success = true;
 	if (g.cfg.output_black)
 		success = save_texture_png(black_path, black_rgba, error);
@@ -3453,6 +3544,21 @@ void on_settings_overlay(effect_runtime *runtime) {
 		ImGui::SameLine();
 		if (ImGui::Button(text("Use ReShade/GShade path", "使用 ReShade/GShade 路径"), ImVec2(0.0f, 0.0f)))
 			save_output_directory("");
+		ImGui::TableNextRow();
+		ImGui::TableSetColumnIndex(0);
+		ImGui::TextUnformatted(text("Screenshot filename", "截图文件名"));
+		ImGui::TableSetColumnIndex(1);
+		ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+		ImGui::InputText("##screenshot_filename", g.file_naming_input.data(),
+			g.file_naming_input.size(), ImGuiInputTextFlags_None, nullptr, nullptr);
+		ImGui::TableNextRow();
+		ImGui::TableSetColumnIndex(1);
+		if (ImGui::Button(text("Save filename", "保存文件名"), ImVec2(0.0f, 0.0f))) {
+			if (save_file_naming(g.file_naming_input.data()))
+				show_notification(true, text("Screenshot filename saved", "截图文件名已保存"));
+			else
+				show_notification(false, text("Invalid screenshot filename", "截图文件名无效"));
+		}
 		ImGui::EndTable();
 	}
 	draw_group_list_settings();
