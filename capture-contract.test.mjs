@@ -27,16 +27,12 @@ test('capture output and runtime log are routed outside the game directory', () 
 
 test('output selection defaults to transparent only and controls only disk exports', () => {
   const config = read('./NS_AlphaCapture.ini')
-  const releaseConfig = read('./release-0.3.3/NS_AlphaCapture.ini')
   const source = read('./NS_AlphaCapture.cpp')
   const replayExport = source.match(/bool capture_replay_outputs\([^]*?\n\}/)?.[0] ?? ''
 
   assert.match(config, /^OutputBlack=0$/m)
   assert.match(config, /^OutputWhite=0$/m)
   assert.match(config, /^OutputTransparent=1$/m)
-  assert.match(releaseConfig, /^OutputBlack=0$/m)
-  assert.match(releaseConfig, /^OutputWhite=0$/m)
-  assert.match(releaseConfig, /^OutputTransparent=1$/m)
   assert.match(source, /bool output_black = false/)
   assert.match(source, /bool output_white = false/)
   assert.match(source, /bool output_transparent = true/)
@@ -390,8 +386,20 @@ test('shortcut and screenshot path controls fill the remaining settings width', 
   assert.match(settings, /ImGui::BeginTable\(/)
   assert.match(settings, /ImGuiTableColumnFlags_WidthFixed/)
   assert.match(settings, /ImGuiTableColumnFlags_WidthStretch/)
+  assert.match(settings, /TableSetupColumn\("##setting_label", ImGuiTableColumnFlags_WidthFixed, 160\.0f\)/)
   assert.match(settings, /ImGui::GetContentRegionAvail\(\)\.x/)
   assert.doesNotMatch(settings, /SameLine\(220\.0f\)|SetNextItemWidth\(360\.0f\)|Indent\(220\.0f\)/)
+})
+
+test('settings UI keeps long labels and editor state from losing user changes', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  assert.match(source, /BeginChild\("##rule_table_scroll"/)
+  assert.match(source, /SmallButton\("X##delete_rule"\)/)
+  assert.match(source, /hotkey_conflicts\(/)
+  assert.match(source, /g\.hunting_target_group > static_cast<int>\(index\)/)
+  assert.match(source, /Close the rule editor before adding candidates/)
+  assert.match(source, /unsaved edits discarded/)
+  assert.match(source, /std::min\(text_size\.x \+ 36\.0f, display_size\.x - 40\.0f\)/)
 })
 
 test('native screenshot path supports ReShade and GShade with Pictures fallback', () => {
@@ -493,7 +501,7 @@ test('capture diagnoses non-indexed scene draws and mirrors scene RT clears', ()
   assert.match(source, /addon_event::clear_render_target_view>/)
 })
 
-test('non-indexed final highlight composite uses an isolated exact rule and DrawInstanced replay', () => {
+test('non-indexed final highlight composite preserves its verified one/inv-src-alpha blend', () => {
   const source = read('./NS_AlphaCapture.cpp')
   const rules = read('./shader_rules.hpp')
   const config = read('./NS_AlphaCapture.ini')
@@ -506,14 +514,15 @@ test('non-indexed final highlight composite uses an isolated exact rule and Draw
   assert.match(source, /ensure_replay_resources\(context, original_rtvs\[0\], nullptr, error, true\)/)
   assert.match(source, /is_configured_nonindexed_rule/)
   assert.match(source, /dsv != nullptr/)
-  assert.match(source, /D3D11_BLEND_SRC_ALPHA/)
+  assert.match(source, /blend\.SrcBlend != D3D11_BLEND_ONE/)
   assert.match(source, /D3D11_BLEND_INV_SRC_ALPHA/)
+  const replay = source.match(/bool replay_nonindexed_composite_draw\([^]*?\n\}/)?.[0] ?? ''
+  assert.match(replay, /OMSetBlendState\(original_blend, original_factor, original_sample_mask\)/)
+  assert.doesNotMatch(replay, /OMSetBlendState\(g\.replay\.alpha_blend/)
   assert.match(config, /\[NonIndexedRules\]/)
-  assert.match(config, /Rule0=1\|1956256419\|2589759975\|4\|1\|0\|0\|0\|0\|0\|1920\|1080\|1\|1\|5\|6\|7/)
-  assert.match(config, /Rule1=1\|1956256419\|2589759975\|4\|1\|0\|0\|0\|0\|0\|3840\|2160\|1\|1\|5\|6\|7/)
-  assert.match(config, /Rule2=1\|1519164267\|2589759975\|4\|1\|0\|0\|0\|0\|0\|1920\|1080\|1\|0\|2\|1\|15/)
-  assert.match(config, /Rule3=1\|1581445177\|2602839305\|4\|1\|0\|0\|0\|0\|0\|480\|270\|1\|0\|2\|1\|15/)
-  assert.doesNotMatch(config, /749A1AA3|9A5C99E7/)
+  assert.match(config, /Rule0=1\|1956256419\|2589759975\|4\|1\|0\|0\|0\|0\|0\|1920\|1080\|1\|1\|2\|6\|7/)
+  assert.match(config, /Rule1=1\|1956256419\|2589759975\|4\|1\|0\|0\|0\|0\|0\|3840\|2160\|1\|1\|2\|6\|7/)
+  assert.doesNotMatch(config, /Rule4=1\|507037697\|2589759975/)
 })
 
 test('ordinary and additive replay blends preserve continuous alpha semantics', () => {

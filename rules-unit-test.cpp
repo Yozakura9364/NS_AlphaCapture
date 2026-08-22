@@ -102,6 +102,26 @@ static void test_nonindexed_composite_exact_match() {
 		0, 0, 0, 3840, 2160, false, true, 5, 6, 7));
 }
 
+static void test_nonindexed_one_inv_src_alpha_exact_match() {
+	nonindexed_rule rule;
+	rule.enabled = true;
+	rule.pixel = 1956256419u;
+	rule.vertex = 2589759975u;
+	rule.vertex_count = 4;
+	rule.instance_count = 1;
+	rule.render_target_width = 1920;
+	rule.render_target_height = 1080;
+	rule.src_blend = 2;
+	rule.dest_blend = 6;
+	rule.write_mask = 7;
+	CHECK(nonindexed_rule_matches(rule, 1956256419u, 2589759975u, 4, 1, 0, 0,
+		0, 0, 0, 1920, 1080, false, true, 2, 6, 7));
+	CHECK(!nonindexed_rule_matches(rule, 1956256419u, 2589759975u, 4, 1, 0, 0,
+		0, 0, 0, 1920, 1080, false, true, 5, 6, 7));
+	CHECK(!nonindexed_rule_matches(rule, 1956256419u, 2589759975u, 4, 1, 0, 0,
+		0, 0, 0, 3840, 2160, false, true, 2, 6, 7));
+}
+
 static void test_nonindexed_intermediate_rules_parse_and_match() {
 	ini_document document;
 	document.set("NonIndexedRules", "AmountRules", "2");
@@ -363,6 +383,7 @@ int main() {
 	test_disabled_and_incomplete_rules_never_match();
 	test_group_active_gates_matching();
 	test_nonindexed_composite_exact_match();
+	test_nonindexed_one_inv_src_alpha_exact_match();
 	test_nonindexed_intermediate_rules_parse_and_match();
 	test_v1_migration_preserves_groups_and_disables_hash_only();
 	test_v1_migration_removes_old_sections();

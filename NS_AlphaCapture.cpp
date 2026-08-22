@@ -323,7 +323,7 @@ std::string key_name(uint32_t key) {
 
 std::string format_hotkey(uint32_t key, uint32_t modifiers) {
 	if (key == 0)
-		return "Press a key";
+		return text("Press a key", "请按下一个键");
 	std::string result;
 	if (modifiers & ns_white_backing::modifier_ctrl) result += "Ctrl + ";
 	if (modifiers & ns_white_backing::modifier_shift) result += "Shift + ";
@@ -1824,8 +1824,9 @@ bool replay_nonindexed_composite_draw(command_list *cmd_list, uint32_t vertex_co
 	}
 	original_blend->GetDesc(&original_blend_desc);
 	const D3D11_RENDER_TARGET_BLEND_DESC &blend = original_blend_desc.RenderTarget[0];
-	if (!blend.BlendEnable || blend.SrcBlend != D3D11_BLEND_SRC_ALPHA ||
-		blend.DestBlend != D3D11_BLEND_INV_SRC_ALPHA || blend.RenderTargetWriteMask != 0x07) {
+	if (!blend.BlendEnable || blend.SrcBlend != D3D11_BLEND_ONE ||
+		blend.DestBlend != D3D11_BLEND_INV_SRC_ALPHA ||
+		blend.BlendOp != D3D11_BLEND_OP_ADD || blend.RenderTargetWriteMask != 0x07) {
 		log_line("non-indexed replay skipped ps=%u: blend mismatch", pixel_hash);
 		original_blend->Release();
 		for (ID3D11RenderTargetView *rtv : original_rtvs)
@@ -1850,7 +1851,7 @@ bool replay_nonindexed_composite_draw(command_list *cmd_list, uint32_t vertex_co
 	const UINT restore_count = replay_restore_rtv_count(original_rtvs);
 	const uint64_t original_resource_id = render_target_resource_id(original_rtvs[0]);
 	initialize_replay_targets(context, original_resource_id);
-	context->OMSetBlendState(g.replay.alpha_blend.Get(), original_factor, original_sample_mask);
+	context->OMSetBlendState(original_blend, original_factor, original_sample_mask);
 	context->OMSetDepthStencilState(replay_depth_state.Get(), original_stencil_ref);
 	++g_replay_depth;
 	ID3D11RenderTargetView *replay_rtv = g.replay.black_rtv.Get();
@@ -1877,10 +1878,28 @@ bool replay_nonindexed_composite_draw(command_list *cmd_list, uint32_t vertex_co
 	g.replay_frame_has_draws = true;
 	++g.replay_draw_count;
 	++g.replay_nonindexed_draw_count;
-	log_line("non-indexed composite replayed ps=%u vs=%u vertices=%u instances=%u target=%ux%u dsv=null blend=src_alpha_inv_src_alpha",
+	log_line("non-indexed composite replayed ps=%u vs=%u vertices=%u instances=%u target=%ux%u dsv=null blend=one_inv_src_alpha",
 		pixel_hash, vertex_hash, vertex_count, instance_count,
 		g.replay.width, g.replay.height);
 	return true;
+}
+
+bool hotkey_conflicts(uint32_t key, uint32_t modifiers, int ignored_group,
+	bool ignore_capture, bool ignore_reload) {
+	if (key == 0)
+		return false;
+	const uint32_t packed = pack_toggle_key(key, modifiers);
+	if (!ignore_capture && packed == pack_toggle_key(g.cfg.capture_key, g.cfg.capture_modifiers))
+		return true;
+	if (!ignore_reload && packed == pack_toggle_key(g.cfg.reload_key, g.cfg.reload_modifiers))
+		return true;
+	for (size_t index = 0; index < g.rule_groups.size(); ++index) {
+		if (static_cast<int>(index) != ignored_group &&
+			g.rule_groups[index].toggle_key_packed != 0 &&
+			g.rule_groups[index].toggle_key_packed == packed)
+			return true;
+	}
+	return false;
 }
 
 bool read_replay_rgba32f(ID3D11Texture2D *source, rgba32f_image &image, std::string &error) {
@@ -2712,6 +2731,11 @@ void finish_hotkey_capture(uint32_t key, uint32_t modifiers) {
 	if (g.hotkey_capture_target >= 100) {
 		const size_t group_index = static_cast<size_t>(g.hotkey_capture_target - 100);
 		const uint32_t packed = pack_toggle_key(key, modifiers);
+		if (hotkey_conflicts(key, modifiers, static_cast<int>(group_index), false, false)) {
+			show_notification(false, text("Shortcut is already in use", "快捷键已被使用"));
+			g.hotkey_capture_target = 0;
+			return;
+		}
 		if (g.group_editor_index == static_cast<int>(group_index)) {
 			g.group_editor_work.toggle_key_packed = packed;
 			show_notification(true, std::string(text("Toggle key staged: ", "组快捷键已暂存：")) +
@@ -2728,6 +2752,11 @@ void finish_hotkey_capture(uint32_t key, uint32_t modifiers) {
 	const bool capture = g.hotkey_capture_target == 1;
 	const char *key_name_value = capture ? "CaptureKey" : "ReloadKey";
 	const char *modifiers_name = capture ? "CaptureModifiers" : "ReloadModifiers";
+	if (hotkey_conflicts(key, modifiers, -1, capture, !capture)) {
+		show_notification(false, text("Shortcut is already in use", "快捷键已被使用"));
+		g.hotkey_capture_target = 0;
+		return;
+	}
 	if (!save_hotkey(key_name_value, modifiers_name, key, modifiers)) {
 		show_notification(false, capture_failure_message(text("could not save shortcut", "无法保存快捷键")));
 		g.hotkey_capture_target = 0;
@@ -2846,7 +2875,7 @@ void draw_group_editor_inline(size_t index) {
 	uint32_t key = 0;
 	uint32_t modifiers = 0;
 	unpack_toggle_key(g.group_editor_work.toggle_key_packed, key, modifiers);
-	ImGui::TextUnformatted(text("Toggle key", "切换快捷键"));
+	ImGui::TextUnformatted(text("Toggle key", "快捷键"));
 	ImGui::SameLine(120.0f);
 	const std::string key_label = (g.hotkey_capture_target == 100 + static_cast<int>(index) ?
 		std::string(text("Press a new shortcut...", "请按下新的快捷键…")) :
@@ -2864,15 +2893,19 @@ void draw_group_editor_inline(size_t index) {
 			show_notification(false, text("Group name cannot be empty", "组名称不能为空"));
 		} else {
 			ns_alpha_rules::rule_group &group = g.rule_groups[index];
+			const ns_alpha_rules::rule_group previous_group = group;
 			const bool runtime_active = group.active;
 			const std::vector<ns_alpha_rules::capture_rule> rules = group.rules;
 			group = g.group_editor_work;
 			group.name = new_name;
 			group.rules = rules;
 			group.active = runtime_active;
-			if (save_rule_groups())
+			if (save_rule_groups()) {
 				show_notification(true, text("Group saved", "分组已保存"));
-			g.group_editor_index = -1;
+				g.group_editor_index = -1;
+			} else {
+				group = previous_group;
+			}
 		}
 	}
 	ImGui::SameLine();
@@ -2904,6 +2937,8 @@ void draw_rule_editor_window() {
 	ImGui::TextUnformatted(text(
 		"An enabled rule requires a complete PS+VS+FirstIndex+IndexCount+VertexOffset signature.",
 		"启用规则必须同时具备 PS、VS、FirstIndex、IndexCount、VertexOffset 完整签名。"));
+	ImGui::BeginChild("##rule_table_scroll", ImVec2(0.0f, -96.0f), false,
+		ImGuiWindowFlags_HorizontalScrollbar);
 	if (ImGui::BeginTable("##rule_table", 9, ImGuiTableFlags_SizingStretchProp |
 		ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_NoSavedSettings)) {
 		ImGui::TableSetupColumn(text("On", "启用"), ImGuiTableColumnFlags_WidthFixed, 40.0f);
@@ -2974,7 +3009,7 @@ void draw_rule_editor_window() {
 				break;
 			}
 			ImGui::SameLine();
-			if (ImGui::SmallButton(text("Delete", "删除"))) {
+			if (ImGui::SmallButton("X##delete_rule")) {
 				g.rule_editor_work.erase(g.rule_editor_work.begin() +
 					static_cast<ptrdiff_t>(index));
 				g.rule_editor_names.erase(g.rule_editor_names.begin() +
@@ -2982,10 +3017,13 @@ void draw_rule_editor_window() {
 				ImGui::PopID();
 				break;
 			}
+			if (ImGui::IsItemHovered())
+				ImGui::SetTooltip("%s", text("Delete rule", "删除规则"));
 			ImGui::PopID();
 		}
 		ImGui::EndTable();
 	}
+	ImGui::EndChild();
 	if (ImGui::Button(text("Add rule", "新增规则"))) {
 		g.rule_editor_work.push_back(ns_alpha_rules::capture_rule{});
 		g.rule_editor_names.push_back({});
@@ -3120,6 +3158,8 @@ void draw_hunting_window() {
 		for (int stage = 0; stage < 3; ++stage) {
 			if (!ImGui::BeginTabItem(stage_names[stage]))
 				continue;
+			if (g.hunting_stage != stage)
+				stop_preview();
 			g.hunting_stage = stage;
 			if (stage == 2) {
 				ImGui::TextUnformatted(text(
@@ -3224,6 +3264,13 @@ void draw_hunting_window() {
 			if (ImGui::SmallButton(text("Add candidate", "加入候选"))) {
 				if (g.hunting_target_group >= 0 &&
 					static_cast<size_t>(g.hunting_target_group) < g.rule_groups.size()) {
+					if (g.rule_editor_index == g.hunting_target_group) {
+						show_notification(false, text(
+							"Close the rule editor before adding candidates",
+							"请先关闭规则编辑器再加入候选"));
+						ImGui::PopID();
+						break;
+					}
 					ns_alpha_rules::capture_rule rule;
 					rule.enabled = false;
 					rule.pixel = candidate.rule.pixel;
@@ -3231,8 +3278,17 @@ void draw_hunting_window() {
 					rule.first_index = candidate.rule.first_index;
 					rule.index_count = candidate.rule.index_count;
 					rule.vertex_offset = candidate.rule.vertex_offset;
-					g.rule_groups[static_cast<size_t>(g.hunting_target_group)]
-						.rules.push_back(rule);
+					auto &target_rules = g.rule_groups[static_cast<size_t>(g.hunting_target_group)].rules;
+					const bool duplicate = std::any_of(target_rules.begin(), target_rules.end(),
+						[&rule](const ns_alpha_rules::capture_rule &existing) {
+							return ns_alpha_rules::rule_signature_equals(existing, rule);
+						});
+					if (duplicate) {
+						show_notification(false, text("Candidate rule already exists", "候选规则已存在"));
+						ImGui::PopID();
+						break;
+					}
+					target_rules.push_back(rule);
 					if (save_rule_groups())
 						show_notification(true, text(
 							"Candidate rule added (disabled)", "已加入候选规则（未启用）"));
@@ -3274,21 +3330,35 @@ void draw_group_list_settings() {
 	for (size_t index = 0; index < g.rule_groups.size(); ++index) {
 		ns_alpha_rules::rule_group &group = g.rule_groups[index];
 		ImGui::PushID(static_cast<int>(index));
-		if (ImGui::SmallButton(text("X", "删"))) {
+		if (ImGui::SmallButton("X##delete_group")) {
 			g.rule_groups.erase(g.rule_groups.begin() + static_cast<ptrdiff_t>(index));
 			close_group_editors();
 			if (g.hunting_target_group == static_cast<int>(index))
 				g.hunting_target_group = -1;
+			else if (g.hunting_target_group > static_cast<int>(index))
+				--g.hunting_target_group;
 			if (save_rule_groups())
 				show_notification(true, text("Group deleted and config rewritten",
 					"分组已删除并重写配置"));
 			ImGui::PopID();
 			break;
 		}
+		if (ImGui::IsItemHovered())
+			ImGui::SetTooltip("%s", text("Delete group", "删除分组"));
 		ImGui::SameLine();
 		bool active = group.active;
 		if (ImGui::Checkbox("##group_active", &active))
 			group.active = active;
+		ImGui::SameLine();
+		if (ImGui::SmallButton(text("Edit group", "编辑分组")))
+			open_group_editor(index);
+		if (ImGui::IsItemHovered())
+			ImGui::SetTooltip("%s", text("Edit group", "编辑分组"));
+		ImGui::SameLine();
+		if (ImGui::SmallButton(text("Edit rules", "编辑规则")))
+			open_rule_editor(index);
+		if (ImGui::IsItemHovered())
+			ImGui::SetTooltip("%s", text("Edit rules", "编辑规则"));
 		ImGui::SameLine();
 		uint32_t key = 0;
 		uint32_t modifiers = 0;
@@ -3301,12 +3371,6 @@ void draw_group_list_settings() {
 		ImGui::Text("%zu %s (%s) %s %zu/%zu", index, group.name.c_str(),
 			key == 0 ? text("no key", "无快捷键") : format_hotkey(key, modifiers).c_str(),
 			text("rules:", "规则："), enabled_rules, group.rules.size());
-		ImGui::SameLine();
-		if (ImGui::SmallButton(text("Edit group", "编辑分组")))
-			open_group_editor(index);
-		ImGui::SameLine();
-		if (ImGui::SmallButton(text("Edit rules", "编辑规则")))
-			open_rule_editor(index);
 		draw_group_editor_inline(index);
 		ImGui::PopID();
 	}
@@ -3328,7 +3392,7 @@ void on_settings_overlay(effect_runtime *runtime) {
 	};
 	if (ImGui::BeginTable("##capture_settings", 2,
 		ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
-		ImGui::TableSetupColumn("##setting_label", ImGuiTableColumnFlags_WidthFixed);
+		ImGui::TableSetupColumn("##setting_label", ImGuiTableColumnFlags_WidthFixed, 160.0f);
 		ImGui::TableSetupColumn("##setting_control", ImGuiTableColumnFlags_WidthStretch);
 		draw_hotkey_row(text("Capture shortcut", "捕获快捷键"), 1, g.cfg.capture_key, g.cfg.capture_modifiers);
 		draw_hotkey_row(text("Reload configuration", "重新载入配置"), 2, g.cfg.reload_key, g.cfg.reload_modifiers);
@@ -3354,13 +3418,22 @@ void on_settings_overlay(effect_runtime *runtime) {
 	bool output_black = g.cfg.output_black;
 	bool output_white = g.cfg.output_white;
 	bool output_transparent = g.cfg.output_transparent;
-	ImGui::TextUnformatted(text("Output", "输出"));
-	ImGui::SameLine(220.0f);
-	bool output_changed = ImGui::Checkbox(text("Black background", "黑底图"), &output_black);
-	ImGui::SameLine();
-	output_changed |= ImGui::Checkbox(text("White background", "白底图"), &output_white);
-	ImGui::SameLine();
-	output_changed |= ImGui::Checkbox(text("Transparent", "透明图"), &output_transparent);
+	bool output_changed = false;
+	if (ImGui::BeginTable("##output_settings", 2,
+		ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
+		ImGui::TableSetupColumn("##output_label", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+		ImGui::TableSetupColumn("##output_controls", ImGuiTableColumnFlags_WidthStretch);
+		ImGui::TableNextRow();
+		ImGui::TableSetColumnIndex(0);
+		ImGui::TextUnformatted(text("Output", "输出"));
+		ImGui::TableSetColumnIndex(1);
+		output_changed |= ImGui::Checkbox(text("Black background", "黑底图"), &output_black);
+		ImGui::SameLine();
+		output_changed |= ImGui::Checkbox(text("White background", "白底图"), &output_white);
+		ImGui::SameLine();
+		output_changed |= ImGui::Checkbox(text("Transparent", "透明图"), &output_transparent);
+		ImGui::EndTable();
+	}
 	if (output_changed) {
 		if (!output_black && !output_white && !output_transparent) {
 			show_notification(false, capture_failure_message(
@@ -3440,10 +3513,14 @@ void on_reshade_present(effect_runtime *runtime) {
 
 	const bool reload_down = ns_white_backing::hotkey_down(g.cfg.reload_key, g.cfg.reload_modifiers);
 	if (reload_down && !reload_was_down) {
+		const bool discarded_edits = g.group_editor_index >= 0 || g.rule_editor_index >= 0;
 		if (load_config()) {
 			if (ensure_output_directory()) {
 				log_line("configuration reloaded");
-				show_notification(true, text("NS Alpha Capture - Configuration reloaded", "NS Alpha Capture - 配置已重新载入"));
+				show_notification(true, discarded_edits ?
+					text("Configuration reloaded; unsaved edits discarded",
+						"配置已重新载入，未保存的编辑已丢弃") :
+					text("NS Alpha Capture - Configuration reloaded", "NS Alpha Capture - 配置已重新载入"));
 			} else {
 				capture_failure("cannot create output directory after reload");
 			}
@@ -3462,7 +3539,7 @@ void on_reshade_overlay(effect_runtime *) {
 		return;
 
 	const ImVec2 text_size = ImGui::CalcTextSize(g.notification_message.c_str());
-	const float banner_width = text_size.x + 36.0f;
+	const float banner_width = std::min(text_size.x + 36.0f, display_size.x - 40.0f);
 	const float banner_height = text_size.y + 22.0f;
 	const float left = (display_size.x - banner_width) * 0.5f;
 	const float top = 22.0f;
