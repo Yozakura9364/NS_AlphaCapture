@@ -14,6 +14,11 @@ constexpr uint32_t modifier_shift = 1u << 0;
 constexpr uint32_t modifier_ctrl = 1u << 1;
 constexpr uint32_t modifier_alt = 1u << 2;
 constexpr uint32_t modifier_win = 1u << 3;
+constexpr uint32_t supported_modifier_mask = modifier_shift | modifier_ctrl | modifier_alt;
+
+inline uint32_t sanitize_modifiers(uint32_t modifiers) {
+	return modifiers & supported_modifier_mask;
+}
 
 inline std::string trim_copy(std::string value) {
 	const size_t begin = value.find_first_not_of(" \t\r\n");
@@ -125,16 +130,15 @@ inline bool try_parse_modifiers(const std::string &raw_value, uint32_t &out) {
 
 template <typename IsDown>
 inline bool hotkey_down(uint32_t key, uint32_t modifiers, IsDown &&is_down) {
+	modifiers = sanitize_modifiers(modifiers);
 	if (key == 0 || !is_down(key))
 		return false;
 	const bool shift_down = is_down(VK_SHIFT) || is_down(VK_LSHIFT) || is_down(VK_RSHIFT);
 	const bool ctrl_down = is_down(VK_CONTROL) || is_down(VK_LCONTROL) || is_down(VK_RCONTROL);
 	const bool alt_down = is_down(VK_MENU) || is_down(VK_LMENU) || is_down(VK_RMENU);
-	const bool win_down = is_down(VK_LWIN) || is_down(VK_RWIN);
 	return ((modifiers & modifier_shift) == 0 || shift_down) &&
 		((modifiers & modifier_ctrl) == 0 || ctrl_down) &&
-		((modifiers & modifier_alt) == 0 || alt_down) &&
-		((modifiers & modifier_win) == 0 || win_down);
+		((modifiers & modifier_alt) == 0 || alt_down);
 }
 
 inline bool hotkey_down(uint32_t key, uint32_t modifiers) {

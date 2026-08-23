@@ -48,9 +48,8 @@ struct nonindexed_rule {
 
 inline bool nonindexed_rule_can_be_enabled(const nonindexed_rule &rule) {
 	return rule.pixel != 0 && rule.vertex != 0 && rule.vertex_count != 0 &&
-		rule.instance_count != 0 &&
-		((rule.render_target_width == 0 && rule.render_target_height == 0) ||
-		 (rule.render_target_width != 0 && rule.render_target_height != 0));
+		rule.instance_count != 0 && rule.render_target_width != 0 &&
+		rule.render_target_height != 0;
 }
 
 inline void nonindexed_rule_force_candidate_if_incomplete(nonindexed_rule &rule) {
@@ -71,8 +70,8 @@ inline bool nonindexed_rule_matches(const nonindexed_rule &rule,
 		rule.first_vertex == first_vertex && rule.first_instance == first_instance &&
 		rule.index_count == index_count && rule.first_index == first_index &&
 		rule.vertex_offset == vertex_offset &&
-		(rule.render_target_width == 0 || rule.render_target_width == render_target_width) &&
-		(rule.render_target_height == 0 || rule.render_target_height == render_target_height) &&
+		rule.render_target_width == render_target_width &&
+		rule.render_target_height == render_target_height &&
 		(!rule.require_null_dsv || !dsv_bound) && rule.blend_enable == blend_enable &&
 		rule.src_blend == src_blend && rule.dest_blend == dest_blend &&
 		rule.write_mask == write_mask;

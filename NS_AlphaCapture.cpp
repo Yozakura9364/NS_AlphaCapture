@@ -61,6 +61,7 @@ struct config {
 	bool output_transparent = true;
 	std::string file_naming = default_file_naming;
 	bool auto_match = true;
+	bool auto_highlight = true;
 	bool lens_only = false;
 	bool lens_capture = true;
 	uint32_t lens_pixel_shader_hash = 3361469263u;
@@ -89,6 +90,18 @@ struct shader_candidate {
 	shader_rule rule;
 	uint32_t draw_count = 0;
 	uint64_t render_target = 0;
+};
+
+struct nonindexed_candidate {
+	uint32_t pixel = 0;
+	uint32_t vertex = 0;
+	uint32_t vertex_count = 0;
+	uint32_t instance_count = 0;
+	uint32_t first_vertex = 0;
+	uint32_t first_instance = 0;
+	uint32_t width = 0;
+	uint32_t height = 0;
+	uint32_t draw_count = 0;
 };
 
 struct command_state {
@@ -187,6 +200,7 @@ struct state {
 	std::vector<ns_alpha_rules::rule_group> rule_groups;
 	std::vector<ns_alpha_rules::nonindexed_rule> nonindexed_rules;
 	std::vector<shader_candidate> shader_candidates;
+	std::vector<nonindexed_candidate> nonindexed_candidates;
 	bool shader_selector_active = false;
 	ns_alpha_rules::preview_state preview;
 	int group_editor_index = -1;
@@ -227,6 +241,7 @@ bool capture_failure(const std::string &detail);
 bool current_render_target_is_learned(ID3D11DeviceContext *context);
 void sync_file_naming_input();
 bool read_reshade_setting(const char *section, const char *key, std::string &value);
+void log_line(const char *format, ...);
 
 uint64_t command_key(command_list *cmd_list) {
 	return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cmd_list));
@@ -347,7 +362,6 @@ std::string format_hotkey(uint32_t key, uint32_t modifiers) {
 	if (modifiers & ns_white_backing::modifier_ctrl) result += "Ctrl + ";
 	if (modifiers & ns_white_backing::modifier_shift) result += "Shift + ";
 	if (modifiers & ns_white_backing::modifier_alt) result += "Alt + ";
-	if (modifiers & ns_white_backing::modifier_win) result += "Win + ";
 	return result + key_name(key);
 }
 
@@ -457,7 +471,6 @@ std::string hotkey_modifier_name(uint32_t modifiers) {
 	if (modifiers & ns_white_backing::modifier_ctrl) value += "Ctrl+";
 	if (modifiers & ns_white_backing::modifier_shift) value += "Shift+";
 	if (modifiers & ns_white_backing::modifier_alt) value += "Alt+";
-	if (modifiers & ns_white_backing::modifier_win) value += "Win+";
 	if (!value.empty()) value.pop_back();
 	return value.empty() ? "None" : value;
 }
@@ -583,6 +596,95 @@ bool read_ini_setting(const std::wstring &path, const char *section, const char 
 		if (end == std::string::npos)
 			break;
 		start = end + 1;
+	}
+	return false;
+}
+
+bool is_auto_highlight_target_format(DXGI_FORMAT format) {
+	switch (format) {
+	case DXGI_FORMAT_R16G16B16A16_FLOAT:
+	case DXGI_FORMAT_R16G16B16A16_UNORM:
+	case DXGI_FORMAT_R11G11B10_FLOAT:
+	case DXGI_FORMAT_R10G10B10A2_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+		return true;
+	default:
+		return false;
+	}
+}
+
+bool is_auto_highlight_shape(uint32_t vertex_count, uint32_t instance_count,
+	uint32_t first_vertex, uint32_t first_instance, ID3D11RenderTargetView *rtv,
+	ID3D11DepthStencilView *dsv, ID3D11BlendState *blend, uint32_t *width = nullptr,
+	uint32_t *height = nullptr) {
+	if (rtv == nullptr || dsv != nullptr || blend == nullptr ||
+		(vertex_count != 3 && vertex_count != 4) || instance_count != 1 ||
+		first_vertex != 0 || first_instance != 0)
+		return false;
+	ComPtr<ID3D11Resource> resource;
+	rtv->GetResource(&resource);
+	ComPtr<ID3D11Texture2D> texture;
+	if (resource == nullptr || FAILED(resource.As(&texture)))
+		return false;
+	D3D11_TEXTURE2D_DESC target_desc = {};
+	texture->GetDesc(&target_desc);
+	if (target_desc.SampleDesc.Count != 1 || target_desc.Width < 640 ||
+		target_desc.Height < 360 || !is_auto_highlight_target_format(target_desc.Format))
+		return false;
+	D3D11_BLEND_DESC blend_desc = {};
+	blend->GetDesc(&blend_desc);
+	const D3D11_RENDER_TARGET_BLEND_DESC &rt_blend = blend_desc.RenderTarget[0];
+	if (!rt_blend.BlendEnable || rt_blend.SrcBlend != D3D11_BLEND_ONE ||
+		rt_blend.DestBlend != D3D11_BLEND_INV_SRC_ALPHA ||
+		rt_blend.BlendOp != D3D11_BLEND_OP_ADD || rt_blend.RenderTargetWriteMask != 0x07)
+		return false;
+	if (width != nullptr)
+		*width = target_desc.Width;
+	if (height != nullptr)
+		*height = target_desc.Height;
+	return true;
+}
+
+void record_nonindexed_candidate(const shader_hashes &hashes, uint32_t vertex_count,
+	uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance,
+	uint32_t width, uint32_t height) {
+	for (nonindexed_candidate &candidate : g.nonindexed_candidates) {
+		if (candidate.pixel == hashes.pixel && candidate.vertex == hashes.vertex &&
+			candidate.vertex_count == vertex_count && candidate.instance_count == instance_count &&
+			candidate.first_vertex == first_vertex && candidate.first_instance == first_instance &&
+			candidate.width == width && candidate.height == height) {
+			++candidate.draw_count;
+			return;
+		}
+	}
+	if (g.nonindexed_candidates.size() >= 256)
+		return;
+	nonindexed_candidate candidate;
+	candidate.pixel = hashes.pixel;
+	candidate.vertex = hashes.vertex;
+	candidate.vertex_count = vertex_count;
+	candidate.instance_count = instance_count;
+	candidate.first_vertex = first_vertex;
+	candidate.first_instance = first_instance;
+	candidate.width = width;
+	candidate.height = height;
+	candidate.draw_count = 1;
+	g.nonindexed_candidates.push_back(candidate);
+	log_line("auto_highlight learned non-indexed candidate ps=%u vs=%u vertices=%u instances=%u target=%ux%u",
+		hashes.pixel, hashes.vertex, vertex_count, instance_count, width, height);
+}
+
+bool has_learned_nonindexed_candidate(const shader_hashes &hashes, uint32_t vertex_count,
+	uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance) {
+	for (const nonindexed_candidate &candidate : g.nonindexed_candidates) {
+		if (candidate.pixel == hashes.pixel && candidate.vertex == hashes.vertex &&
+			candidate.vertex_count == vertex_count && candidate.instance_count == instance_count &&
+			candidate.first_vertex == first_vertex && candidate.first_instance == first_instance &&
+			candidate.draw_count >= 2)
+			return true;
 	}
 	return false;
 }
@@ -811,7 +913,7 @@ void read_hotkey(const std::vector<std::pair<std::string, std::string>> &entries
 	if (key_value != nullptr && ns_white_backing::try_parse_virtual_key(*key_value, parsed))
 		key = parsed;
 	if (modifiers_value != nullptr && ns_white_backing::try_parse_modifiers(*modifiers_value, parsed))
-		modifiers = parsed;
+		modifiers = ns_white_backing::sanitize_modifiers(parsed);
 }
 
 bool load_config() {
@@ -858,6 +960,9 @@ bool load_config() {
 	if (const std::string *auto_match_value = find_config_value(entries, "AutoMatch"))
 		fresh.auto_match = *auto_match_value == "1" || *auto_match_value == "true" ||
 			*auto_match_value == "TRUE";
+	if (const std::string *auto_highlight_value = find_config_value(entries, "AutoHighlight"))
+		fresh.auto_highlight = *auto_highlight_value == "1" || *auto_highlight_value == "true" ||
+			*auto_highlight_value == "TRUE";
 	if (const std::string *lens_only_value = find_config_value(entries, "LensOnly"))
 		fresh.lens_only = *lens_only_value == "1" || *lens_only_value == "true" ||
 			*lens_only_value == "TRUE";
@@ -2042,12 +2147,24 @@ bool replay_nonindexed_composite_draw(command_list *cmd_list, uint32_t vertex_co
 			if (rtv != nullptr) rtv->Release();
 		return false;
 	}
+	ComPtr<ID3D11Resource> target_resource;
+	original_rtvs[0]->GetResource(&target_resource);
+	ComPtr<ID3D11Texture2D> target_texture;
+	D3D11_TEXTURE2D_DESC target_desc = {};
+	if (target_resource != nullptr && SUCCEEDED(target_resource.As(&target_texture)))
+		target_texture->GetDesc(&target_desc);
+	const bool reuse_captured_scene = g.replay_frame_started;
+	if (reuse_captured_scene && target_desc.Width != 0 && target_desc.Height != 0 &&
+		(g.replay.width != target_desc.Width || g.replay.height != target_desc.Height))
+		log_line("non-indexed composite target=%ux%u reusing captured scene=%ux%u without reset",
+			target_desc.Width, target_desc.Height, g.replay.width, g.replay.height);
 	ID3D11DepthStencilState *original_depth_state = nullptr;
 	UINT original_stencil_ref = 0;
 	context->OMGetDepthStencilState(&original_depth_state, &original_stencil_ref);
 	std::string error;
 	ComPtr<ID3D11DepthStencilState> replay_depth_state;
-	if (!ensure_replay_resources(context, original_rtvs[0], nullptr, error, true) ||
+	if ((!reuse_captured_scene &&
+		 !ensure_replay_resources(context, original_rtvs[0], nullptr, error, true)) ||
 		!make_replay_depth_state(g.replay.device.Get(), original_depth_state,
 			replay_depth_state, false, error)) {
 		log_line("non-indexed replay skipped ps=%u: %s", pixel_hash, error.c_str());
@@ -2059,7 +2176,8 @@ bool replay_nonindexed_composite_draw(command_list *cmd_list, uint32_t vertex_co
 	}
 	const UINT restore_count = replay_restore_rtv_count(original_rtvs);
 	const uint64_t original_resource_id = render_target_resource_id(original_rtvs[0]);
-	initialize_replay_targets(context, original_resource_id);
+	if (!reuse_captured_scene)
+		initialize_replay_targets(context, original_resource_id);
 	context->OMSetBlendState(original_blend, original_factor, original_sample_mask);
 	context->OMSetDepthStencilState(replay_depth_state.Get(), original_stencil_ref);
 	++g_replay_depth;
@@ -2779,11 +2897,19 @@ bool on_draw_indexed(command_list *cmd_list, uint32_t index_count, uint32_t inst
 				vertex_offset, first_instance, hashes.pixel, true);
 		}
 	}
-	if (g.replay_capture_active && is_configured_shader_rule(hashes, index_count, first_index,
-		vertex_offset) &&
-		current_render_target_is_learned(context))
-		return replay_color_draw(cmd_list, index_count, instance_count, first_index,
-			vertex_offset, first_instance, hashes.pixel, false);
+	const bool configured = is_configured_shader_rule(hashes, index_count, first_index,
+		vertex_offset);
+	if (configured) {
+		mesh_signature configured_mesh;
+		bool configured_additive = false;
+		if (query_mesh_signature(context, arguments, configured_mesh) &&
+			query_color_replay_state(context, configured_mesh, configured_additive)) {
+			remember_current_render_target(context);
+			if (g.replay_capture_active)
+				return replay_color_draw(cmd_list, index_count, instance_count, first_index,
+					vertex_offset, first_instance, hashes.pixel, false);
+		}
+	}
 	if (g.cfg.auto_match) {
 		bool discard_shader = false;
 		{
@@ -2855,7 +2981,7 @@ bool on_draw_indexed(command_list *cmd_list, uint32_t index_count, uint32_t inst
 
 bool on_draw(command_list *cmd_list, uint32_t vertex_count, uint32_t instance_count,
 	uint32_t first_vertex, uint32_t first_instance) {
-	if (cmd_list == nullptr || g_replay_depth != 0 || !g.replay_capture_active)
+	if (cmd_list == nullptr || g_replay_depth != 0)
 		return false;
 	ID3D11DeviceContext *context = reinterpret_cast<ID3D11DeviceContext *>(cmd_list->get_native());
 	if (context == nullptr)
@@ -2868,9 +2994,25 @@ bool on_draw(command_list *cmd_list, uint32_t vertex_count, uint32_t instance_co
 	UINT sample_mask = 0;
 	context->OMGetBlendState(&blend, factor, &sample_mask);
 	const shader_hashes hashes = current_shader_hashes(cmd_list);
+	uint32_t target_width = 0;
+	uint32_t target_height = 0;
+	const bool auto_shape = g.cfg.auto_highlight &&
+		is_auto_highlight_shape(vertex_count, instance_count, first_vertex, first_instance,
+			rtv, dsv, blend, &target_width, &target_height);
+	if (auto_shape)
+		record_nonindexed_candidate(hashes, vertex_count, instance_count, first_vertex,
+			first_instance, target_width, target_height);
+	if (!g.replay_capture_active) {
+		if (blend != nullptr) blend->Release();
+		if (rtv != nullptr) rtv->Release();
+		if (dsv != nullptr) dsv->Release();
+		return false;
+	}
 	const bool configured = is_configured_nonindexed_rule(hashes, vertex_count, instance_count,
 		first_vertex, first_instance, rtv, dsv, blend);
-	if (configured) {
+	const bool auto_learned = auto_shape && has_learned_nonindexed_candidate(hashes,
+		vertex_count, instance_count, first_vertex, first_instance);
+	if (configured || auto_learned) {
 		const bool replayed = replay_nonindexed_composite_draw(cmd_list, vertex_count,
 			instance_count, first_vertex, first_instance, hashes.pixel, hashes.vertex);
 		if (blend != nullptr) blend->Release();
@@ -2980,8 +3122,6 @@ uint32_t current_imgui_modifiers() {
 		modifiers |= ns_white_backing::modifier_shift;
 	if (ImGui::IsKeyDown(ImGuiKey_LeftAlt) || ImGui::IsKeyDown(ImGuiKey_RightAlt))
 		modifiers |= ns_white_backing::modifier_alt;
-	if (ImGui::IsKeyDown(ImGuiKey_LeftSuper) || ImGui::IsKeyDown(ImGuiKey_RightSuper))
-		modifiers |= ns_white_backing::modifier_win;
 	return modifiers;
 }
 
@@ -2996,8 +3136,6 @@ uint32_t current_runtime_modifiers(effect_runtime *runtime) {
 		modifiers |= ns_white_backing::modifier_shift;
 	if (is_down(VK_MENU) || is_down(VK_LMENU) || is_down(VK_RMENU))
 		modifiers |= ns_white_backing::modifier_alt;
-	if (is_down(VK_LWIN) || is_down(VK_RWIN))
-		modifiers |= ns_white_backing::modifier_win;
 	return modifiers;
 }
 
@@ -3008,6 +3146,7 @@ bool runtime_hotkey_pressed(effect_runtime *runtime, uint32_t key, uint32_t modi
 }
 
 void finish_hotkey_capture(uint32_t key, uint32_t modifiers) {
+	modifiers = ns_white_backing::sanitize_modifiers(modifiers);
 	if (g.hotkey_capture_target >= 100) {
 		const size_t group_index = static_cast<size_t>(g.hotkey_capture_target - 100);
 		const uint32_t packed = pack_toggle_key(key, modifiers);
@@ -3897,8 +4036,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 		reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
 		reshade::register_event<reshade::addon_event::reshade_overlay>(on_reshade_overlay);
 		reshade::register_overlay(nullptr, on_settings_overlay);
-		log_line("=== NS_AlphaCapture loaded: color draw replay exporter auto_match=%u ===",
-			g.cfg.auto_match ? 1u : 0u);
+		log_line("=== NS_AlphaCapture loaded: color draw replay exporter auto_match=%u auto_highlight=%u ===",
+			g.cfg.auto_match ? 1u : 0u, g.cfg.auto_highlight ? 1u : 0u);
 	} else if (reason == DLL_PROCESS_DETACH) {
 		reshade::unregister_overlay(nullptr, on_settings_overlay);
 		reshade::unregister_event<reshade::addon_event::reshade_overlay>(on_reshade_overlay);

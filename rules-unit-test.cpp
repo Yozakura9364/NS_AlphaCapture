@@ -1,4 +1,5 @@
 #include "shader_rules.hpp"
+#include "NS_Hotkey.hpp"
 
 #include <cstdio>
 #include <string>
@@ -122,26 +123,19 @@ static void test_nonindexed_one_inv_src_alpha_exact_match() {
 		0, 0, 0, 3840, 2160, false, true, 2, 6, 7));
 }
 
-static void test_nonindexed_wildcard_resolution_matches_any_render_target() {
-	ini_document document;
-	document.set("NonIndexedRules", "AmountRules", "1");
-	document.set("NonIndexedRules", "Rule0",
-		"1|1956256419|2589759975|4|1|0|0|0|0|0|0|0|1|1|2|6|7");
-	std::vector<nonindexed_rule> rules = nonindexed_rules_from_document(document);
-	CHECK(rules.size() == 1);
-	CHECK(rules[0].enabled);
-	nonindexed_rule &rule = rules[0];
-	CHECK(nonindexed_rule_matches(rule, 1956256419u, 2589759975u, 4, 1, 0, 0,
-		0, 0, 0, 2560, 1440, false, true, 2, 6, 7));
-	CHECK(nonindexed_rule_matches(rule, 1956256419u, 2589759975u, 4, 1, 0, 0,
-		0, 0, 0, 3440, 1440, false, true, 2, 6, 7));
-	CHECK(nonindexed_rule_matches(rule, 1956256419u, 2589759975u, 4, 1, 0, 0,
-		0, 0, 0, 3840, 2160, false, true, 2, 6, 7));
-	rule.render_target_width = 2560;
-	CHECK(!nonindexed_rule_can_be_enabled(rule));
-	rule.render_target_height = 1440;
-	CHECK(!nonindexed_rule_matches(rule, 1956256419u, 2589759975u, 4, 1, 0, 0,
-		0, 0, 0, 3440, 1440, false, true, 2, 6, 7));
+static void test_win_modifier_is_removed_without_changing_other_modifiers() {
+	uint32_t parsed = 0;
+	CHECK(ns_white_backing::try_parse_modifiers("Ctrl+Shift+Win", parsed));
+	CHECK((parsed & ns_white_backing::modifier_win) != 0);
+	const uint32_t sanitized = ns_white_backing::sanitize_modifiers(parsed);
+	CHECK((sanitized & ns_white_backing::modifier_ctrl) != 0);
+	CHECK((sanitized & ns_white_backing::modifier_shift) != 0);
+	CHECK((sanitized & ns_white_backing::modifier_alt) == 0);
+	CHECK((sanitized & ns_white_backing::modifier_win) == 0);
+	CHECK(ns_white_backing::hotkey_down(VK_F10, parsed, [](uint32_t key) {
+		return key == VK_F10 || key == VK_CONTROL || key == VK_LCONTROL ||
+			key == VK_SHIFT || key == VK_LSHIFT;
+	}));
 }
 
 static void test_nonindexed_intermediate_rules_parse_and_match() {
@@ -404,9 +398,9 @@ int main() {
 	test_no_cartesian_product();
 	test_disabled_and_incomplete_rules_never_match();
 	test_group_active_gates_matching();
+	test_win_modifier_is_removed_without_changing_other_modifiers();
 	test_nonindexed_composite_exact_match();
 	test_nonindexed_one_inv_src_alpha_exact_match();
-	test_nonindexed_wildcard_resolution_matches_any_render_target();
 	test_nonindexed_intermediate_rules_parse_and_match();
 	test_v1_migration_preserves_groups_and_disables_hash_only();
 	test_v1_migration_removes_old_sections();

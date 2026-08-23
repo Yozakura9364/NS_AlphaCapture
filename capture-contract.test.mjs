@@ -372,11 +372,27 @@ test('shortcut capture keeps modifiers across frames and runtime matching uses R
   assert.match(runtimeModifiers, /VK_CONTROL/)
   assert.match(runtimeModifiers, /VK_SHIFT/)
   assert.match(runtimeModifiers, /VK_MENU/)
-  assert.match(runtimeModifiers, /VK_RWIN/)
   assert.match(source, /runtime->is_key_pressed\(key\)/)
   assert.match(source, /current_runtime_modifiers\(runtime\) == modifiers/)
   assert.match(source, /g\.hotkey_modifier_latch \|=/)
   assert.match(source, /process_hotkey_capture\(runtime\)/)
+})
+
+test('Win is disabled as a shortcut modifier while legacy INI values remain readable', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const imguiModifiers = source.match(/uint32_t current_imgui_modifiers\(\)\s*\{[^]*?\n\}/)?.[0] ?? ''
+  const runtimeModifiers = source.match(
+    /uint32_t current_runtime_modifiers\(effect_runtime \*runtime\)\s*\{[^]*?\n\}/,
+  )?.[0] ?? ''
+  const formatter = source.match(/std::string format_hotkey\([^]*?\n\}/)?.[0] ?? ''
+  const serializer = source.match(/std::string hotkey_modifier_name\([^]*?\n\}/)?.[0] ?? ''
+
+  assert.doesNotMatch(imguiModifiers, /Super/)
+  assert.doesNotMatch(runtimeModifiers, /VK_[LR]WIN/)
+  assert.doesNotMatch(formatter, /modifier_win|Win \+/)
+  assert.doesNotMatch(serializer, /modifier_win|Win\+/)
+  assert.match(source, /ns_white_backing::sanitize_modifiers\(parsed\)/)
+  assert.match(source, /ns_white_backing::sanitize_modifiers\(modifiers\)/)
 })
 
 test('addon settings and foreground notifications follow ReShade zh-CN language', () => {
@@ -568,6 +584,18 @@ test('auto-match replays newly learned scene draws during the capture frame', ()
   assert.doesNotMatch(source, /target RT is not single-sample R16G16B16A16_FLOAT Texture2D/)
 })
 
+test('configured color draws refresh a recreated scene target without requiring a gear change', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const callback = source.match(/bool on_draw_indexed\([^]*?\n\}/)?.[0] ?? ''
+
+  assert.match(callback, /const bool configured = is_configured_shader_rule\(/)
+  assert.match(callback, /if \(configured\) \{[^]*query_mesh_signature\(context, arguments, configured_mesh\)/)
+  assert.match(callback, /query_color_replay_state\(context, configured_mesh, configured_additive\)/)
+  assert.match(callback, /remember_current_render_target\(context\)/)
+  assert.match(callback, /if \(g\.replay_capture_active\)[^]*replay_color_draw\(/)
+  assert.ok(callback.indexOf('if (configured)') < callback.indexOf('if (g.cfg.auto_match)'))
+})
+
 test('color replay preserves opaque occlusion with read-only depth and stencil', () => {
   const source = read('./NS_AlphaCapture.cpp')
 
@@ -623,10 +651,41 @@ test('non-indexed final highlight composite preserves its verified one/inv-src-a
   assert.match(replay, /OMSetBlendState\(original_blend, original_factor, original_sample_mask\)/)
   assert.doesNotMatch(replay, /OMSetBlendState\(g\.replay\.alpha_blend/)
   assert.match(config, /\[NonIndexedRules\]/)
-  assert.match(config, /Rule0=1\|1956256419\|2589759975\|4\|1\|0\|0\|0\|0\|0\|0\|0\|1\|1\|2\|6\|7/)
-  assert.match(config, /Rule0Name=最终高光合成 任意分辨率/)
-  assert.match(config, /0 表示任意渲染目标分辨率/)
+  assert.match(config, /Rule0=1\|1956256419\|2589759975\|4\|1\|0\|0\|0\|0\|0\|1920\|1080\|1\|1\|2\|6\|7/)
+  assert.match(config, /Rule1=1\|1956256419\|2589759975\|4\|1\|0\|0\|0\|0\|0\|3840\|2160\|1\|1\|2\|6\|7/)
   assert.doesNotMatch(config, /Rule4=1\|507037697\|2589759975/)
+})
+
+test('final highlight candidates are learned from draw state across arbitrary resolutions', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const config = read('./NS_AlphaCapture.ini')
+
+  assert.match(config, /^AutoHighlight=1$/m)
+  assert.match(source, /bool auto_highlight = true/)
+  assert.match(source, /is_auto_highlight_shape\(/)
+  assert.match(source, /record_nonindexed_candidate\(/)
+  assert.match(source, /has_learned_nonindexed_candidate\(/)
+  assert.match(source, /vertex_count != 3 && vertex_count != 4/)
+  assert.match(source, /D3D11_BLEND_ONE/)
+  assert.match(source, /D3D11_BLEND_INV_SRC_ALPHA/)
+  assert.match(source, /RenderTargetWriteMask != 0x07/)
+  assert.match(source, /dsv != nullptr/)
+  assert.match(source, /candidate\.draw_count >= 2/)
+  assert.match(source, /if \(!g\.replay_capture_active\)/)
+  assert.match(source, /auto_highlight learned non-indexed candidate/)
+})
+
+test('later composites reuse the captured scene across render-target size changes', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const replay = source.match(/bool replay_nonindexed_composite_draw\([^]*?\n\}/)?.[0] ?? ''
+
+  assert.match(replay, /const bool reuse_captured_scene = g\.replay_frame_started/)
+  assert.match(replay, /g\.replay\.width != target_desc\.Width/)
+  assert.match(replay, /g\.replay\.height != target_desc\.Height/)
+  assert.match(replay, /reusing captured scene=%ux%u without reset/)
+  assert.match(replay, /\(!reuse_captured_scene &&\s*!ensure_replay_resources\(/)
+  assert.match(replay, /if \(!reuse_captured_scene\)\s*initialize_replay_targets\(/)
+  assert.match(replay, /context->DrawInstanced\(vertex_count, instance_count, first_vertex, first_instance\)/)
 })
 
 test('ordinary and additive replay blends preserve continuous alpha semantics', () => {
