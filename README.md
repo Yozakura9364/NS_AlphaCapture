@@ -1,5 +1,7 @@
 # NS Alpha Capture
 
+作者：Nightingale Silence
+
 这是 FFXIV DX11 + ReShade 的透明 RGBA 捕获研究工具。addon 自动识别 ordered-dither 半透明网格，并据此学习主场景颜色 RT。捕获帧中，同一主场景 RT 上的普通 indexed draw 会按原顺序分别重放到私有黑底和白底 `R32G32B32A32_FLOAT` RT；命中的半透明颜色 draw 则使用连续 alpha 重放到两路 RT。帧末由 addon 直接读回两张 RT 并重建 RGBA。用户可以在设置面板选择是否保存黑底图、白底图和透明图；该选择只影响落盘，内部双底渲染始终完整执行。
 
 私有双底链路不读取 Generic Depth，不做 4x4 统计回推，也不替换游戏 shader。黑 RT 从纯黑开始，白 RT 从纯白开始，每个命中的游戏 draw 都实际执行两次，再用两张 RT 的差值重建 RGBA；不存在 `White = Black + (1 - Alpha)` 数学白底。镜片 draw 继续集成在同一黑白回放链中，不再额外导出独立的镜片诊断文件。
@@ -24,9 +26,9 @@
 2026-08-18_12-00-00-000_Final.png
 ```
 
-`Ctrl+Shift+F9` 会重新读取热键、`OutputDirectory` 和输出选择。`OutputDirectory=` 为空时，首次载入会继承 `ReShade.ini` 或 `GShade.ini` 的 `[SCREENSHOT] SavePath`；两者都没有有效设置时使用 Windows“图片”目录。设置面板可以直接编辑并保存截图路径，也可以一键恢复使用 ReShade/GShade 路径。输出选择会立即写入 `OutputBlack`、`OutputWhite`、`OutputTransparent`，至少要保留一种。日志固定保存在 addon 所在目录的 `NS_AlphaCapture.log`（与 `NS_AlphaCapture.addon64` 同目录），不会写入用户截图输出目录；会记录捕获武装、目标 hash、RT 创建、indexed/non-indexed draw 数、主 RT clear 数、像素覆盖统计和失败原因。
+`Ctrl+Shift+F9` 会重新读取热键、`OutputDirectory`、`FileNaming` 和输出选择。`OutputDirectory=` 与 `FileNaming=` 为空时，插件会通过 ReShade 配置 API 自动继承当前 `ReShade.ini` 或 `GShade.ini` 的 `[SCREENSHOT] SavePath` 与 `FileNaming`；API 不可用时再直接读取配置文件。没有有效路径时使用 Windows“图片”目录，没有有效命名格式时使用插件内置的 ReShade 风格格式。设置面板可以直接编辑并保存截图路径。输出选择会立即写入 `OutputBlack`、`OutputWhite`、`OutputTransparent`，至少要保留一种。日志固定保存在 addon 所在目录的 `NS_AlphaCapture.log`（与 `NS_AlphaCapture.addon64` 同目录），不会写入用户截图输出目录；会记录捕获武装、目标 hash、RT 创建、indexed/non-indexed draw 数、主 RT clear 数、像素覆盖统计和失败原因。
 
-`FileNaming` 控制导出文件名模板，默认值为 `%Date%_%TimeHour%-%TimeMinute%-%TimeSecond%-%TimeMS%`。支持 `%Date%`、`%TimeHour%`、`%TimeMinute%`、`%TimeSecond%` 和 `%TimeMS%` 占位符；导出时分别追加 `_Black.png`、`_White.png`、`_Final.png`。设置面板中的“截图文件名”可直接修改并保存，非法 Windows 文件名字符会被替换为下划线。
+`FileNaming` 控制导出文件名模板。插件配置留空时使用 ReShade/GShade 当前的 `[SCREENSHOT] FileNaming`，仅在两者都没有有效值时回退到 `%Date%_%TimeHour%-%TimeMinute%-%TimeSecond%-%TimeMS%`。支持 `%Date%`、`%TimeHour%`、`%TimeMinute%`、`%TimeSecond%` 和 `%TimeMS%` 占位符；导出时分别追加 `_Black.png`、`_White.png`、`_Final.png`。设置面板中的“截图文件名”可直接修改并保存，非法 Windows 文件名字符会被替换为下划线。
 
 ### 自动网格匹配
 

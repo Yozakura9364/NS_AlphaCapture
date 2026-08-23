@@ -20,6 +20,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -212,6 +213,7 @@ struct state {
 	std::vector<ComPtr<ID3D11Resource>> learned_scene_targets;
 	bool locale_zh = false;
 	int hotkey_capture_target = 0;
+	uint32_t hotkey_modifier_latch = ns_white_backing::modifier_none;
 	uint32_t hotkey_suppress_key = 0;
 	std::array<char, 1024> output_path_input = {};
 	std::array<char, 512> file_naming_input = {};
@@ -224,6 +226,7 @@ bool shader_contains_discard(const void *code, size_t code_size);
 bool capture_failure(const std::string &detail);
 bool current_render_target_is_learned(ID3D11DeviceContext *context);
 void sync_file_naming_input();
+bool read_reshade_setting(const char *section, const char *key, std::string &value);
 
 uint64_t command_key(command_list *cmd_list) {
 	return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cmd_list));
@@ -290,22 +293,31 @@ std::string capture_failure_message(const std::string &detail) {
 
 bool read_ini_setting(const std::wstring &path, const char *section, const char *key, std::string &value);
 
-void update_locale(effect_runtime *runtime) {
+bool system_prefers_chinese() {
+	ULONG language_count = 0;
+	ULONG buffer_size = 0;
+	if (!GetThreadPreferredUILanguages(MUI_LANGUAGE_NAME | MUI_UI_FALLBACK,
+		&language_count, nullptr, &buffer_size) || buffer_size == 0)
+		return false;
+	std::vector<wchar_t> languages(buffer_size);
+	if (!GetThreadPreferredUILanguages(MUI_LANGUAGE_NAME | MUI_UI_FALLBACK,
+		&language_count, languages.data(), &buffer_size) || language_count == 0)
+		return false;
+	const wchar_t *language = languages.data();
+	return (language[0] == L'z' || language[0] == L'Z') &&
+		(language[1] == L'h' || language[1] == L'H') &&
+		(language[2] == L'\0' || language[2] == L'-' || language[2] == L'_');
+}
+
+void update_locale(effect_runtime *) {
 	std::string language;
-	if (runtime != nullptr) {
-		char buffer[64] = {};
-		size_t size = sizeof(buffer);
-		if (reshade::get_config_value(runtime, "OVERLAY", "Language", buffer, &size))
-			language = buffer;
-	}
-	if (language.empty())
-		read_ini_setting(g.reshade_ini_path, "OVERLAY", "Language", language);
+	read_reshade_setting("OVERLAY", "Language", language);
 	std::transform(language.begin(), language.end(), language.begin(), [](unsigned char c) {
 		return static_cast<char>(std::tolower(c));
 	});
-	if (!language.empty())
-		g.locale_zh = language == "6" || language == "zh" ||
-			language.rfind("zh-", 0) == 0 || language.rfind("zh_", 0) == 0;
+	g.locale_zh = language.empty() ? system_prefers_chinese() :
+		language == "6" || language == "zh" ||
+		language.rfind("zh-", 0) == 0 || language.rfind("zh_", 0) == 0;
 }
 
 std::string key_name(uint32_t key) {
@@ -575,6 +587,16 @@ bool read_ini_setting(const std::wstring &path, const char *section, const char 
 	return false;
 }
 
+bool read_reshade_setting(const char *section, const char *key, std::string &value) {
+	std::array<char, 4096> buffer = {};
+	size_t size = buffer.size();
+	if (reshade::get_config_value(nullptr, section, key, buffer.data(), &size)) {
+		value.assign(buffer.data(), strnlen_s(buffer.data(), buffer.size()));
+		return true;
+	}
+	return read_ini_setting(g.reshade_ini_path, section, key, value);
+}
+
 bool utf8_to_wide(const std::string &value, std::wstring &result) {
 	result.clear();
 	if (value.empty())
@@ -815,10 +837,21 @@ bool load_config() {
 	read_bool("OutputBlack", fresh.output_black);
 	read_bool("OutputWhite", fresh.output_white);
 	read_bool("OutputTransparent", fresh.output_transparent);
+	bool file_naming_from_addon = false;
 	if (const std::string *file_naming_value = find_config_value(entries, "FileNaming")) {
 		const std::string trimmed = trim_ascii(*file_naming_value);
-		if (!trimmed.empty() && trimmed.find_first_of("\r\n") == std::string::npos)
+		if (!trimmed.empty() && trimmed.find_first_of("\r\n") == std::string::npos) {
 			fresh.file_naming = trimmed;
+			file_naming_from_addon = true;
+		}
+	}
+	if (!file_naming_from_addon) {
+		std::string reshade_file_naming;
+		if (read_reshade_setting("SCREENSHOT", "FileNaming", reshade_file_naming)) {
+			const std::string trimmed = trim_ascii(reshade_file_naming);
+			if (!trimmed.empty() && trimmed.find_first_of("\r\n") == std::string::npos)
+				fresh.file_naming = trimmed;
+		}
 	}
 	if (!fresh.output_black && !fresh.output_white && !fresh.output_transparent)
 		fresh.output_transparent = true;
@@ -886,7 +919,7 @@ bool load_config() {
 		}
 	} else {
 		std::string screenshot_path;
-		if (read_ini_setting(g.reshade_ini_path, "SCREENSHOT", "SavePath", screenshot_path) &&
+		if (read_reshade_setting("SCREENSHOT", "SavePath", screenshot_path) &&
 			!screenshot_path.empty() && !utf8_to_wide(screenshot_path, output_directory)) {
 			g.config_loaded = false;
 			g.config_error = "ReShade screenshot path is not valid UTF-8";
@@ -935,7 +968,7 @@ bool save_output_directory(const std::string &configured_value) {
 		}
 	} else {
 		std::string reshade_path;
-		if (read_ini_setting(g.reshade_ini_path, "SCREENSHOT", "SavePath", reshade_path) &&
+		if (read_reshade_setting("SCREENSHOT", "SavePath", reshade_path) &&
 			!reshade_path.empty() && !utf8_to_wide(reshade_path, resolved)) {
 			capture_failure(text("ReShade screenshot path is not valid UTF-8", "ReShade 截图路径不是有效的 UTF-8"));
 			return false;
@@ -1271,33 +1304,122 @@ bool save_texture_png(const std::wstring &path, const rgba_image &image, std::st
 	return true;
 }
 
-std::string expand_file_naming(const std::string &pattern, const SYSTEMTIME &now) {
+std::string current_preset_name(effect_runtime *runtime) {
+	if (runtime == nullptr)
+		return {};
+	char path[1024] = {};
+	runtime->get_current_preset_path(path);
+	std::string value = path;
+	const size_t separator = value.find_last_of("/\\");
+	if (separator != std::string::npos)
+		value.erase(0, separator + 1);
+	const size_t extension = value.find_last_of('.');
+	if (extension != std::string::npos)
+		value.erase(extension);
+	return value;
+}
+
+std::string current_app_name() {
+	std::array<wchar_t, 32768> module_path = {};
+	const DWORD length = GetModuleFileNameW(nullptr, module_path.data(),
+		static_cast<DWORD>(module_path.size()));
+	if (length == 0 || length >= module_path.size())
+		return {};
+	std::wstring value(module_path.data(), length);
+	const size_t separator = value.find_last_of(L"\\/");
+	if (separator != std::wstring::npos)
+		value.erase(0, separator + 1);
+	const size_t extension = value.find_last_of(L'.');
+	if (extension != std::wstring::npos)
+		value.erase(extension);
+	std::string result;
+	return wide_to_utf8(value, result) ? result : std::string();
+}
+
+std::string expand_reshade_macro_string(const std::string &input,
+	const std::vector<std::pair<std::string, std::string>> &macros) {
+	std::string result;
+	for (size_t offset = 0; offset < input.size();) {
+		const size_t macro_begin = input.find('%', offset);
+		if (macro_begin == std::string::npos) {
+			result += input.substr(offset);
+			break;
+		}
+		const size_t macro_end = input.find('%', macro_begin + 1);
+		if (macro_end == std::string::npos) {
+			result += input.substr(offset);
+			break;
+		}
+		result += input.substr(offset, macro_begin - offset);
+		if (macro_end == macro_begin + 1) {
+			result += '%';
+			offset = macro_end + 1;
+			continue;
+		}
+
+		std::string_view replacing(input.data() + macro_begin + 1,
+			macro_end - macro_begin - 1);
+		const size_t colon = replacing.find(':');
+		const std::string name(replacing.substr(0, colon));
+		std::string value;
+		for (const auto &macro : macros) {
+			if (_stricmp(name.c_str(), macro.first.c_str()) == 0) {
+				value = macro.second;
+				break;
+			}
+		}
+
+		if (colon == std::string_view::npos) {
+			result += value;
+		} else {
+			const std::string_view parameter = replacing.substr(colon + 1);
+			const size_t insert = parameter.find('$');
+			if (insert == std::string_view::npos) {
+				result += parameter;
+			} else {
+				result += parameter.substr(0, insert);
+				result += value;
+				result += parameter.substr(insert + 1);
+			}
+		}
+		offset = macro_end + 1;
+	}
+	return result;
+}
+
+std::string expand_file_naming(const std::string &pattern, const SYSTEMTIME &now,
+	const std::string &preset_name, const std::string &app_name, uint64_t count) {
 	char date[16] = {};
+	char time[16] = {};
+	char year[8] = {};
+	char month[4] = {};
+	char day[4] = {};
 	char hour[4] = {};
 	char minute[4] = {};
 	char second[4] = {};
 	char milliseconds[8] = {};
-	// Match ReShade's %Date% expansion: ISO date with hyphens.
 	sprintf_s(date, "%04u-%02u-%02u", now.wYear, now.wMonth, now.wDay);
+	sprintf_s(time, "%02u-%02u-%02u", now.wHour, now.wMinute, now.wSecond);
+	sprintf_s(year, "%04u", now.wYear);
+	sprintf_s(month, "%02u", now.wMonth);
+	sprintf_s(day, "%02u", now.wDay);
 	sprintf_s(hour, "%02u", now.wHour);
 	sprintf_s(minute, "%02u", now.wMinute);
 	sprintf_s(second, "%02u", now.wSecond);
 	sprintf_s(milliseconds, "%03u", now.wMilliseconds);
 	std::string expanded = pattern.empty() ? default_file_naming : pattern;
-	const std::array<std::pair<const char *, const char *>, 5> tokens = {{
-		{ "%Date%", date },
-		{ "%TimeHour%", hour },
-		{ "%TimeMinute%", minute },
-		{ "%TimeSecond%", second },
-		{ "%TimeMS%", milliseconds },
-	}};
-	for (const auto &[token, value] : tokens) {
-		for (size_t position = expanded.find(token); position != std::string::npos;
-			position = expanded.find(token, position + strlen(value))) {
-			expanded.replace(position, strlen(token), value);
-		}
-	}
-	return expanded;
+	return expand_reshade_macro_string(expanded, {
+		{ "AppName", app_name }, { "PresetName", preset_name },
+		{ "Count", std::to_string(count) },
+		{ "Date", date }, { "DateYear", year }, { "Year", year },
+		{ "DateMonth", month }, { "Month", month },
+		{ "DateDay", day }, { "Day", day },
+		{ "Time", time }, { "TimeHour", hour }, { "Hour", hour },
+		{ "TimeMinute", minute }, { "Minute", minute },
+		{ "TimeSecond", second }, { "Second", second },
+		{ "TimeMillisecond", milliseconds }, { "Millisecond", milliseconds },
+		{ "TimeMS", milliseconds },
+	});
 }
 
 std::wstring sanitize_capture_file_name(const std::wstring &value) {
@@ -1318,12 +1440,13 @@ std::wstring sanitize_capture_file_name(const std::wstring &value) {
 	return sanitized;
 }
 
-std::wstring make_capture_prefix() {
+std::wstring make_capture_prefix(effect_runtime *runtime) {
 	SYSTEMTIME now = {};
 	GetLocalTime(&now);
 	++g.capture_serial;
 	std::wstring file_name;
-	if (!utf8_to_wide(expand_file_naming(g.cfg.file_naming, now), file_name))
+	if (!utf8_to_wide(expand_file_naming(g.cfg.file_naming, now,
+		current_preset_name(runtime), current_app_name(), g.capture_serial), file_name))
 		file_name = L"capture";
 	return g.output_dir + L"\\" + sanitize_capture_file_name(file_name);
 }
@@ -2177,7 +2300,7 @@ bool capture_lens_effect_outputs(effect_runtime *runtime, const std::wstring &pr
 	return true;
 }
 
-bool capture_replay_outputs(effect_runtime *) {
+bool capture_replay_outputs(effect_runtime *runtime) {
 	if (!g.config_loaded)
 		return capture_failure(g.config_error.empty() ? "configuration is unavailable" : g.config_error);
 	if (!g.replay_frame_has_draws)
@@ -2222,7 +2345,7 @@ bool capture_replay_outputs(effect_runtime *) {
 	const rgba_image black_rgba = make_display_image(black_raw);
 	const rgba_image white_rgba = make_display_image(white_raw);
 	const rgba_image &final_rgba = rgba;
-	const std::wstring prefix = make_capture_prefix();
+	const std::wstring prefix = make_capture_prefix(runtime);
 	const std::wstring black_path = prefix + L"_Black.png";
 	const std::wstring white_path = prefix + L"_White.png";
 	const std::wstring final_path = prefix + L"_Final.png";
@@ -2862,6 +2985,28 @@ uint32_t current_imgui_modifiers() {
 	return modifiers;
 }
 
+uint32_t current_runtime_modifiers(effect_runtime *runtime) {
+	if (runtime == nullptr)
+		return ns_white_backing::modifier_none;
+	uint32_t modifiers = ns_white_backing::modifier_none;
+	const auto is_down = [runtime](uint32_t key) { return runtime->is_key_down(key); };
+	if (is_down(VK_CONTROL) || is_down(VK_LCONTROL) || is_down(VK_RCONTROL))
+		modifiers |= ns_white_backing::modifier_ctrl;
+	if (is_down(VK_SHIFT) || is_down(VK_LSHIFT) || is_down(VK_RSHIFT))
+		modifiers |= ns_white_backing::modifier_shift;
+	if (is_down(VK_MENU) || is_down(VK_LMENU) || is_down(VK_RMENU))
+		modifiers |= ns_white_backing::modifier_alt;
+	if (is_down(VK_LWIN) || is_down(VK_RWIN))
+		modifiers |= ns_white_backing::modifier_win;
+	return modifiers;
+}
+
+bool runtime_hotkey_pressed(effect_runtime *runtime, uint32_t key, uint32_t modifiers) {
+	if (runtime == nullptr || key == 0 || !runtime->is_key_pressed(key))
+		return false;
+	return current_runtime_modifiers(runtime) == modifiers;
+}
+
 void finish_hotkey_capture(uint32_t key, uint32_t modifiers) {
 	if (g.hotkey_capture_target >= 100) {
 		const size_t group_index = static_cast<size_t>(g.hotkey_capture_target - 100);
@@ -2909,27 +3054,34 @@ void finish_hotkey_capture(uint32_t key, uint32_t modifiers) {
 	g.hotkey_capture_target = 0;
 }
 
-void process_hotkey_capture() {
-	if (g.hotkey_capture_target == 0)
+void process_hotkey_capture(effect_runtime *runtime) {
+	if (g.hotkey_capture_target == 0 || runtime == nullptr)
 		return;
 	ImGui::SetNextFrameWantCaptureKeyboard(true);
+	g.hotkey_modifier_latch |= current_imgui_modifiers() | current_runtime_modifiers(runtime);
 	if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
 		g.hotkey_capture_target = 0;
+		g.hotkey_modifier_latch = ns_white_backing::modifier_none;
 		g.hotkey_suppress_key = VK_ESCAPE;
 		return;
 	}
-	if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false) || ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
+	if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false) ||
+		ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
 		finish_hotkey_capture(0, ns_white_backing::modifier_none);
+		g.hotkey_modifier_latch = ns_white_backing::modifier_none;
 		g.hotkey_suppress_key = VK_BACK;
 		return;
 	}
 	for (int value = ImGuiKey_NamedKey_BEGIN; value < ImGuiKey_NamedKey_END; ++value) {
-		const ImGuiKey key = static_cast<ImGuiKey>(value);
+		const ImGuiKey imgui_key = static_cast<ImGuiKey>(value);
 		uint32_t virtual_key = 0;
-		if (!imgui_key_to_virtual_key(key, virtual_key) || virtual_key == VK_ESCAPE ||
-			virtual_key == VK_BACK || virtual_key == VK_DELETE || !ImGui::IsKeyPressed(key, false))
+		if (!imgui_key_to_virtual_key(imgui_key, virtual_key) || virtual_key == VK_ESCAPE ||
+			virtual_key == VK_BACK || virtual_key == VK_DELETE ||
+			!ImGui::IsKeyPressed(imgui_key, false))
 			continue;
-		finish_hotkey_capture(virtual_key, current_imgui_modifiers());
+		finish_hotkey_capture(virtual_key,
+			g.hotkey_modifier_latch | current_imgui_modifiers() | current_runtime_modifiers(runtime));
+		g.hotkey_modifier_latch = ns_white_backing::modifier_none;
 		g.hotkey_suppress_key = virtual_key;
 		return;
 	}
@@ -3016,8 +3168,10 @@ void draw_group_editor_inline(size_t index) {
 		std::string(text("Press a new shortcut...", "请按下新的快捷键…")) :
 		(key == 0 ? std::string(text("Press a key", "请按下一个键")) :
 			format_hotkey(key, modifiers))) + "##group_editor_key";
-	if (ImGui::Button(key_label.c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 0.0f)))
+	if (ImGui::Button(key_label.c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 0.0f))) {
 		g.hotkey_capture_target = 100 + static_cast<int>(index);
+		g.hotkey_modifier_latch = ns_white_backing::modifier_none;
+	}
 
 	ImGui::Checkbox(text("Active at startup", "启动时启用"),
 		&g.group_editor_work.active_at_startup);
@@ -3074,17 +3228,18 @@ void draw_rule_editor_window() {
 		"启用规则必须同时具备 PS、VS、FirstIndex、IndexCount、VertexOffset 完整签名。"));
 	ImGui::BeginChild("##rule_table_scroll", ImVec2(0.0f, -96.0f), false,
 		ImGuiWindowFlags_HorizontalScrollbar);
-	if (ImGui::BeginTable("##rule_table", 9, ImGuiTableFlags_SizingStretchProp |
-		ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_NoSavedSettings)) {
+	if (ImGui::BeginTable("##rule_table", 9, ImGuiTableFlags_Resizable |
+		ImGuiTableFlags_ScrollX | ImGuiTableFlags_SizingFixedFit |
+		ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV)) {
 		ImGui::TableSetupColumn(text("On", "启用"), ImGuiTableColumnFlags_WidthFixed, 40.0f);
-		ImGui::TableSetupColumn("PS", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-		ImGui::TableSetupColumn("VS", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-		ImGui::TableSetupColumn("FirstIndex", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-		ImGui::TableSetupColumn("IndexCount", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-		ImGui::TableSetupColumn("VertexOffset", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-		ImGui::TableSetupColumn(text("Name", "名称"), ImGuiTableColumnFlags_WidthStretch);
-		ImGui::TableSetupColumn(text("State", "状态"), ImGuiTableColumnFlags_WidthFixed, 110.0f);
-		ImGui::TableSetupColumn("##ops", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+		ImGui::TableSetupColumn("PS", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+		ImGui::TableSetupColumn("VS", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+		ImGui::TableSetupColumn("FirstIndex", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+		ImGui::TableSetupColumn("IndexCount", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+		ImGui::TableSetupColumn("VertexOffset", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+		ImGui::TableSetupColumn(text("Name", "名称"), ImGuiTableColumnFlags_WidthFixed, 320.0f);
+		ImGui::TableSetupColumn(text("State", "状态"), ImGuiTableColumnFlags_WidthFixed, 180.0f);
+		ImGui::TableSetupColumn(text("Actions", "操作"), ImGuiTableColumnFlags_WidthFixed, 130.0f);
 		ImGui::TableHeadersRow();
 		for (size_t index = 0; index < g.rule_editor_work.size(); ++index) {
 			ns_alpha_rules::capture_rule &rule = g.rule_editor_work[index];
@@ -3513,7 +3668,15 @@ void draw_group_list_settings() {
 
 void on_settings_overlay(effect_runtime *runtime) {
 	update_locale(runtime);
-	ImGui::TextUnformatted("NS Alpha Capture");
+	const std::array<const char *, 4> setting_labels = {
+		text("Screenshot shortcut", "截图快捷键"),
+		text("Reload shortcut", "重载快捷键"),
+		text("Screenshot path", "截图路径"),
+		text("Screenshot filename", "截图文件名"),
+	};
+	float setting_label_width = 0.0f;
+	for (const char *label : setting_labels)
+		setting_label_width = std::max(setting_label_width, ImGui::CalcTextSize(label).x);
 	const auto draw_hotkey_row = [](const char *label, int target, uint32_t key, uint32_t modifiers) {
 		ImGui::TableNextRow();
 		ImGui::TableSetColumnIndex(0);
@@ -3522,15 +3685,22 @@ void on_settings_overlay(effect_runtime *runtime) {
 		const std::string button_label = (g.hotkey_capture_target == target ?
 			std::string(text("Press a new shortcut...", "请按下新的快捷键…")) : format_hotkey(key, modifiers)) +
 			"##shortcut_" + std::to_string(target);
-		if (ImGui::Button(button_label.c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 0.0f)))
+		if (ImGui::Button(button_label.c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 0.0f))) {
 			g.hotkey_capture_target = target;
+			g.hotkey_modifier_latch = ns_white_backing::modifier_none;
+		}
 	};
+	// Match REST's compact control spacing while adding enough vertical cell padding
+	// for ReShade font scaling to keep adjacent rows from overlapping.
+	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3.0f, 3.0f));
+	ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(3.0f, 5.0f));
 	if (ImGui::BeginTable("##capture_settings", 2,
 		ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
-		ImGui::TableSetupColumn("##setting_label", ImGuiTableColumnFlags_WidthFixed, 160.0f);
+		ImGui::TableSetupColumn("##setting_label", ImGuiTableColumnFlags_WidthFixed,
+			setting_label_width);
 		ImGui::TableSetupColumn("##setting_control", ImGuiTableColumnFlags_WidthStretch);
-		draw_hotkey_row(text("Capture shortcut", "捕获快捷键"), 1, g.cfg.capture_key, g.cfg.capture_modifiers);
-		draw_hotkey_row(text("Reload configuration", "重新载入配置"), 2, g.cfg.reload_key, g.cfg.reload_modifiers);
+		draw_hotkey_row(text("Screenshot shortcut", "截图快捷键"), 1, g.cfg.capture_key, g.cfg.capture_modifiers);
+		draw_hotkey_row(text("Reload shortcut", "重载快捷键"), 2, g.cfg.reload_key, g.cfg.reload_modifiers);
 		ImGui::TableNextRow();
 		ImGui::TableSetColumnIndex(0);
 		ImGui::TextUnformatted(text("Screenshot path", "截图路径"));
@@ -3562,6 +3732,7 @@ void on_settings_overlay(effect_runtime *runtime) {
 		}
 		ImGui::EndTable();
 	}
+	ImGui::PopStyleVar(2);
 	draw_group_list_settings();
 	draw_rule_editor_window();
 	draw_hunting_window();
@@ -3569,9 +3740,13 @@ void on_settings_overlay(effect_runtime *runtime) {
 	bool output_white = g.cfg.output_white;
 	bool output_transparent = g.cfg.output_transparent;
 	bool output_changed = false;
+	const float output_label_width = ImGui::CalcTextSize(text("Output", "输出")).x;
+	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3.0f, 3.0f));
+	ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(3.0f, 5.0f));
 	if (ImGui::BeginTable("##output_settings", 2,
 		ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
-		ImGui::TableSetupColumn("##output_label", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+		ImGui::TableSetupColumn("##output_label", ImGuiTableColumnFlags_WidthFixed,
+			output_label_width);
 		ImGui::TableSetupColumn("##output_controls", ImGuiTableColumnFlags_WidthStretch);
 		ImGui::TableNextRow();
 		ImGui::TableSetColumnIndex(0);
@@ -3584,6 +3759,7 @@ void on_settings_overlay(effect_runtime *runtime) {
 		output_changed |= ImGui::Checkbox(text("Transparent", "透明图"), &output_transparent);
 		ImGui::EndTable();
 	}
+	ImGui::PopStyleVar(2);
 	if (output_changed) {
 		if (!output_black && !output_white && !output_transparent) {
 			show_notification(false, capture_failure_message(
@@ -3601,7 +3777,7 @@ void on_settings_overlay(effect_runtime *runtime) {
 	}
 	if (g.hotkey_capture_target != 0)
 		ImGui::TextUnformatted(text("Esc cancels, Backspace clears", "Esc 取消，Backspace 清除"));
-	process_hotkey_capture();
+	process_hotkey_capture(runtime);
 }
 
 void on_destroy_device(device *) {
@@ -3612,26 +3788,18 @@ void on_destroy_device(device *) {
 }
 
 void on_reshade_present(effect_runtime *runtime) {
-	static bool capture_was_down = false;
-	static bool reload_was_down = false;
 	update_locale(runtime);
 	if (runtime != nullptr) {
 		for (ns_alpha_rules::rule_group &group : g.rule_groups) {
 			uint32_t toggle_key = 0;
 			uint32_t toggle_modifiers = 0;
 			unpack_toggle_key(group.toggle_key_packed, toggle_key, toggle_modifiers);
-			if (toggle_key == 0 || !runtime->is_key_pressed(toggle_key))
+			if (!runtime_hotkey_pressed(runtime, toggle_key, toggle_modifiers))
 				continue;
-			const bool modifiers_match =
-				(((toggle_modifiers & ns_white_backing::modifier_ctrl) != 0) == runtime->is_key_down(VK_CONTROL)) &&
-				(((toggle_modifiers & ns_white_backing::modifier_shift) != 0) == runtime->is_key_down(VK_SHIFT)) &&
-				(((toggle_modifiers & ns_white_backing::modifier_alt) != 0) == runtime->is_key_down(VK_MENU));
-			if (modifiers_match) {
-				group.active = !group.active;
-				show_notification(true, group.active ?
-					std::string(text("Group enabled: ", "已启用组：")) + group.name :
-					std::string(text("Group disabled: ", "已禁用组：")) + group.name);
-			}
+			group.active = !group.active;
+			show_notification(true, group.active ?
+				std::string(text("Group enabled: ", "已启用组：")) + group.name :
+				std::string(text("Group disabled: ", "已禁用组：")) + group.name);
 		}
 	}
 	if (g.replay_capture_active) {
@@ -3648,22 +3816,23 @@ void on_reshade_present(effect_runtime *runtime) {
 	if (g.hotkey_capture_target != 0)
 		return;
 	if (g.hotkey_suppress_key != 0) {
-		if ((GetAsyncKeyState(static_cast<int>(g.hotkey_suppress_key)) & 0x8000) != 0)
+		if (runtime != nullptr && runtime->is_key_down(g.hotkey_suppress_key))
 			return;
 		g.hotkey_suppress_key = 0;
 	}
 
-	const bool capture_down = ns_white_backing::hotkey_down(g.cfg.capture_key, g.cfg.capture_modifiers);
-	if (capture_down && !capture_was_down) {
+	const bool capture_pressed = runtime_hotkey_pressed(runtime, g.cfg.capture_key,
+		g.cfg.capture_modifiers);
+	if (capture_pressed) {
 		reset_replay_frame_state();
 		g.replay_capture_active = true;
 		log_line("capture armed: next frame capture active");
 		show_notification(true, text("NS Alpha Capture - Capturing next color frame", "NS Alpha Capture - 正在捕获下一帧画面"));
 	}
-	capture_was_down = capture_down;
 
-	const bool reload_down = ns_white_backing::hotkey_down(g.cfg.reload_key, g.cfg.reload_modifiers);
-	if (reload_down && !reload_was_down) {
+	const bool reload_pressed = runtime_hotkey_pressed(runtime, g.cfg.reload_key,
+		g.cfg.reload_modifiers);
+	if (reload_pressed) {
 		const bool discarded_edits = g.group_editor_index >= 0 || g.rule_editor_index >= 0;
 		if (load_config()) {
 			if (ensure_output_directory()) {
@@ -3677,7 +3846,6 @@ void on_reshade_present(effect_runtime *runtime) {
 			}
 		}
 	}
-	reload_was_down = reload_down;
 
 }
 

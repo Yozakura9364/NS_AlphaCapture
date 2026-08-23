@@ -1,6 +1,7 @@
 # Built add-ons and local test binaries
 *.addon64
 *.exe
+.codex/
 
 # Capture output and local visual inspection material
 *.png

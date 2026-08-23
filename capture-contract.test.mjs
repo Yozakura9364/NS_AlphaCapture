@@ -56,9 +56,14 @@ test('capture filenames use a configurable ReShade-style token template', () => 
   const config = read('./NS_AlphaCapture.ini')
   const source = read('./NS_AlphaCapture.cpp')
 
-  assert.match(config, /^FileNaming=%Date%_%TimeHour%-%TimeMinute%-%TimeSecond%-%TimeMS%$/m)
+  assert.match(config, /^FileNaming=$/m)
   assert.match(source, /default_file_naming/)
   assert.match(source, /expand_file_naming/)
+  assert.match(source, /expand_reshade_macro_string/)
+  assert.match(source, /current_preset_name/)
+  assert.match(source, /current_app_name/)
+  assert.match(source, /_stricmp\(name\.c_str\(\), macro\.first\.c_str\(\)\)/)
+  assert.match(source, /macro_end == macro_begin \+ 1/)
   assert.match(source, /sanitize_capture_file_name/)
   assert.match(source, /save_file_naming/)
   assert.match(source, /Screenshot filename|截图文件名/)
@@ -66,8 +71,9 @@ test('capture filenames use a configurable ReShade-style token template', () => 
   assert.match(source, /const std::wstring black_path = prefix \+ L"_Black\.png"/)
   assert.match(source, /const std::wstring white_path = prefix \+ L"_White\.png"/)
   assert.match(source, /const std::wstring final_path = prefix \+ L"_Final\.png"/)
-  for (const token of ['%Date%', '%TimeHour%', '%TimeMinute%', '%TimeSecond%', '%TimeMS%'])
-    assert.match(source, new RegExp(token.replaceAll('%', '\\%')))
+  for (const token of ['AppName', 'PresetName', 'Count', 'Date', 'DateYear', 'DateMonth',
+    'DateDay', 'Time', 'TimeHour', 'TimeMinute', 'TimeSecond', 'TimeMillisecond'])
+    assert.match(source, new RegExp(`\\{ "${token}"`))
 })
 
 test('capture is armed for exactly the next frame instead of replaying every frame', () => {
@@ -350,6 +356,27 @@ test('addon settings expose editable capture and reload shortcuts', () => {
   assert.match(source, /CaptureModifiers/)
   assert.match(source, /ReloadKey/)
   assert.match(source, /ReloadModifiers/)
+  assert.match(source, /Screenshot shortcut", "截图快捷键/)
+  assert.match(source, /Reload shortcut", "重载快捷键/)
+  assert.doesNotMatch(source, /Capture shortcut|Reload configuration|捕获快捷键|重新载入配置/)
+})
+
+test('shortcut capture keeps modifiers across frames and runtime matching uses ReShade key state', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const runtimeModifiers = source.match(
+    /uint32_t current_runtime_modifiers\(effect_runtime \*runtime\)\s*\{[^]*?\n\}/,
+  )?.[0] ?? ''
+
+  assert.match(source, /hotkey_modifier_latch/)
+  assert.match(runtimeModifiers, /runtime->is_key_down/)
+  assert.match(runtimeModifiers, /VK_CONTROL/)
+  assert.match(runtimeModifiers, /VK_SHIFT/)
+  assert.match(runtimeModifiers, /VK_MENU/)
+  assert.match(runtimeModifiers, /VK_RWIN/)
+  assert.match(source, /runtime->is_key_pressed\(key\)/)
+  assert.match(source, /current_runtime_modifiers\(runtime\) == modifiers/)
+  assert.match(source, /g\.hotkey_modifier_latch \|=/)
+  assert.match(source, /process_hotkey_capture\(runtime\)/)
 })
 
 test('addon settings and foreground notifications follow ReShade zh-CN language', () => {
@@ -359,12 +386,15 @@ test('addon settings and foreground notifications follow ReShade zh-CN language'
   assert.match(source, /language\.rfind\("zh-", 0\) == 0/)
   assert.match(source, /language\.rfind\("zh_", 0\) == 0/)
   assert.match(source, /language == "6"/)
-  assert.match(source, /get_config_value\(runtime, "OVERLAY", "Language"[^]*read_ini_setting/s)
+  assert.match(source, /read_reshade_setting\("OVERLAY", "Language", language\)/)
+  assert.match(source, /get_config_value\(nullptr, section, key/)
+  assert.match(source, /GetThreadPreferredUILanguages/)
+  assert.match(source, /MUI_LANGUAGE_NAME \| MUI_UI_FALLBACK/)
   assert.match(source, /Screenshot path|截图路径/)
   assert.match(source, /当前帧没有重放到目标颜色绘制/)
   for (const english of [
-    'Capture shortcut',
-    'Reload configuration',
+    'Screenshot shortcut',
+    'Reload shortcut',
     'Press a new shortcut',
     'Shortcut saved',
     'Capturing next color frame',
@@ -373,8 +403,8 @@ test('addon settings and foreground notifications follow ReShade zh-CN language'
     'Capture failed',
   ]) assert.match(source, new RegExp(english.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
   for (const chinese of [
-    '捕获快捷键',
-    '重新载入配置',
+    '截图快捷键',
+    '重载快捷键',
     '请按下新的快捷键',
     '快捷键已保存',
     '正在捕获下一帧画面',
@@ -391,8 +421,11 @@ test('reload defaults to Ctrl+Shift+F9 and first load inherits ReShade screensho
   assert.match(config, /^ReloadKey=F9$/m)
   assert.match(config, /^ReloadModifiers=Ctrl\+Shift$/m)
   assert.match(source, /SavePath/)
+  assert.match(source, /FileNaming/)
   assert.match(source, /reshade_ini_path/)
   assert.match(source, /SCREENSHOT/)
+  assert.match(config, /^FileNaming=$/m)
+  assert.match(source, /get_config_value\(nullptr, section, key/)
 })
 
 test('shortcut and screenshot path controls fill the remaining settings width', () => {
@@ -405,9 +438,25 @@ test('shortcut and screenshot path controls fill the remaining settings width', 
   assert.match(settings, /ImGui::BeginTable\(/)
   assert.match(settings, /ImGuiTableColumnFlags_WidthFixed/)
   assert.match(settings, /ImGuiTableColumnFlags_WidthStretch/)
-  assert.match(settings, /TableSetupColumn\("##setting_label", ImGuiTableColumnFlags_WidthFixed, 160\.0f\)/)
+  assert.match(settings, /ImGui::CalcTextSize/)
+  assert.match(settings, /ImGuiStyleVar_CellPadding/)
+  assert.doesNotMatch(settings, /WidthFixed, (?:160|90)\.0f/)
   assert.match(settings, /ImGui::GetContentRegionAvail\(\)\.x/)
   assert.doesNotMatch(settings, /SameLine\(220\.0f\)|SetNextItemWidth\(360\.0f\)|Indent\(220\.0f\)/)
+})
+
+test('rule editor columns are resizable, horizontally scrollable, and retain user widths', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const editor = source.slice(
+    source.indexOf('void draw_rule_editor_window'),
+    source.indexOf('void draw_hunting_window', source.indexOf('void draw_rule_editor_window')),
+  )
+
+  assert.match(editor, /ImGuiTableFlags_Resizable/)
+  assert.match(editor, /ImGuiTableFlags_ScrollX/)
+  assert.match(editor, /ImGuiTableFlags_SizingFixedFit/)
+  assert.doesNotMatch(editor, /ImGuiTableFlags_NoSavedSettings/)
+  assert.doesNotMatch(editor, /ImGuiTableColumnFlags_NoResize/)
 })
 
 test('settings UI keeps long labels and editor state from losing user changes', () => {
@@ -429,6 +478,30 @@ test('native screenshot path supports ReShade and GShade with Pictures fallback'
   assert.match(source, /FOLDERID_Pictures|CSIDL_MYPICTURES/)
   assert.match(source, /SCREENSHOT/)
   assert.match(source, /SavePath/)
+  assert.match(source, /FileNaming/)
+  assert.match(source, /get_config_value\(nullptr, section, key/)
+})
+
+test('stable build identifies the author and contains no lighting experiment chain', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const resource = read('./NS_AlphaCapture.rc')
+  const build = read('./build.cmd')
+  const config = read('./NS_AlphaCapture.ini')
+  const readme = read('./README.md')
+
+  assert.match(resource, /VALUE "ProductName", "NS Alpha Capture"/)
+  assert.match(resource, /VALUE "CompanyName", "Nightingale Silence"/)
+  assert.match(resource, /VALUE "FileDescription", "Transparent RGBA capture addon for FINAL FANTASY XIV"/)
+  assert.match(resource, /FILEVERSION 0,3,2,0/)
+  assert.match(resource, /PRODUCTVERSION 0,3,2,0/)
+  assert.match(build, /rc \/nologo \/fo NS_AlphaCapture\.res NS_AlphaCapture\.rc/)
+  assert.match(build, /NS_AlphaCapture\.cpp NS_AlphaCapture\.res/)
+  assert.doesNotMatch(source, /Author: Nightingale Silence|作者：Nightingale Silence/)
+  assert.match(readme, /作者：Nightingale Silence/)
+  for (const experiment of ['SceneColorReplay', 'LightDrawProbe', 'Rule7']) {
+    assert.doesNotMatch(source, new RegExp(experiment))
+    assert.doesNotMatch(config, new RegExp(experiment))
+  }
 })
 
 test('screenshot path is editable and persists to the addon configuration', () => {

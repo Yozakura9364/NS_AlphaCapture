@@ -11,8 +11,10 @@ cl /nologo /O2 /EHsc /std:c++17 /utf-8 /DNDEBUG /W4 rules-unit-test.cpp /Fe:rule
 if errorlevel 1 exit /b 1
 rules-unit-test.exe
 if errorlevel 1 exit /b 1
-cl /nologo /LD /O2 /EHsc /std:c++17 /utf-8 /DNDEBUG /W4 /Iinclude NS_AlphaCapture.cpp /link user32.lib windowscodecs.lib ole32.lib /OUT:NS_AlphaCapture.addon64
+rc /nologo /fo NS_AlphaCapture.res NS_AlphaCapture.rc
 if errorlevel 1 exit /b 1
-del /q NS_AlphaCapture.obj NS_AlphaCapture.exp NS_AlphaCapture.lib rules-unit-test.obj >nul 2>&1
+cl /nologo /LD /O2 /EHsc /std:c++17 /utf-8 /DNDEBUG /W4 /Iinclude NS_AlphaCapture.cpp NS_AlphaCapture.res /link user32.lib windowscodecs.lib ole32.lib /OUT:NS_AlphaCapture.addon64
+if errorlevel 1 exit /b 1
+del /q NS_AlphaCapture.obj NS_AlphaCapture.exp NS_AlphaCapture.lib NS_AlphaCapture.res rules-unit-test.obj >nul 2>&1
 echo ADDON BUILD OK
 endlocal
