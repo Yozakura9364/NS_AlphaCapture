@@ -623,8 +623,9 @@ test('non-indexed final highlight composite preserves its verified one/inv-src-a
   assert.match(replay, /OMSetBlendState\(original_blend, original_factor, original_sample_mask\)/)
   assert.doesNotMatch(replay, /OMSetBlendState\(g\.replay\.alpha_blend/)
   assert.match(config, /\[NonIndexedRules\]/)
-  assert.match(config, /Rule0=1\|1956256419\|2589759975\|4\|1\|0\|0\|0\|0\|0\|1920\|1080\|1\|1\|2\|6\|7/)
-  assert.match(config, /Rule1=1\|1956256419\|2589759975\|4\|1\|0\|0\|0\|0\|0\|3840\|2160\|1\|1\|2\|6\|7/)
+  assert.match(config, /Rule0=1\|1956256419\|2589759975\|4\|1\|0\|0\|0\|0\|0\|0\|0\|1\|1\|2\|6\|7/)
+  assert.match(config, /Rule0Name=最终高光合成 任意分辨率/)
+  assert.match(config, /0 表示任意渲染目标分辨率/)
   assert.doesNotMatch(config, /Rule4=1\|507037697\|2589759975/)
 })
 
