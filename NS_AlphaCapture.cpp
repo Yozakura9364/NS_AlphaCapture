@@ -225,6 +225,7 @@ struct state {
 	uint32_t replay_clear_count = 0;
 	uint64_t replay_frame_target_resource = 0;
 	std::vector<ComPtr<ID3D11Resource>> learned_scene_targets;
+	std::vector<ComPtr<ID3D11Resource>> confirmed_scene_targets;
 	bool locale_zh = false;
 	int hotkey_capture_target = 0;
 	uint32_t hotkey_modifier_latch = ns_white_backing::modifier_none;
@@ -2724,6 +2725,10 @@ bool current_render_target_is_learned(ID3D11DeviceContext *context) {
 		if (learned.Get() == resource.Get())
 			return true;
 	}
+	for (const ComPtr<ID3D11Resource> &confirmed : g.confirmed_scene_targets) {
+		if (confirmed.Get() == resource.Get())
+			return true;
+	}
 	return false;
 }
 
@@ -2745,6 +2750,39 @@ void remember_current_render_target(ID3D11DeviceContext *context) {
 	}
 	if (g.learned_scene_targets.size() < 64)
 		g.learned_scene_targets.push_back(std::move(resource));
+}
+
+void remember_confirmed_scene_target(ID3D11DeviceContext *context) {
+	if (context == nullptr)
+		return;
+	ID3D11RenderTargetView *rtv = nullptr;
+	context->OMGetRenderTargets(1, &rtv, nullptr);
+	ComPtr<ID3D11Resource> resource;
+	if (rtv != nullptr)
+		rtv->GetResource(&resource);
+	if (rtv != nullptr)
+		rtv->Release();
+	if (resource == nullptr)
+		return;
+	for (size_t index = 0; index < g.confirmed_scene_targets.size(); ++index) {
+		if (g.confirmed_scene_targets[index].Get() != resource.Get())
+			continue;
+		if (index + 1 != g.confirmed_scene_targets.size()) {
+			ComPtr<ID3D11Resource> recent = std::move(g.confirmed_scene_targets[index]);
+			g.confirmed_scene_targets.erase(g.confirmed_scene_targets.begin() +
+				static_cast<ptrdiff_t>(index));
+			g.confirmed_scene_targets.push_back(std::move(recent));
+		}
+		return;
+	}
+	constexpr size_t max_recent_targets = 4;
+	if (g.confirmed_scene_targets.size() >= max_recent_targets)
+		g.confirmed_scene_targets.erase(g.confirmed_scene_targets.begin());
+	const uint64_t target_id = static_cast<uint64_t>(
+		reinterpret_cast<uintptr_t>(resource.Get()));
+	g.confirmed_scene_targets.push_back(std::move(resource));
+	log_line("scene target refreshed from confirmed final highlight target=0x%llX retained=%zu",
+		static_cast<unsigned long long>(target_id), g.confirmed_scene_targets.size());
 }
 
 void record_shader_candidate(ID3D11DeviceContext *context, const shader_hashes &hashes,
@@ -3002,6 +3040,10 @@ bool on_draw(command_list *cmd_list, uint32_t vertex_count, uint32_t instance_co
 	if (auto_shape)
 		record_nonindexed_candidate(hashes, vertex_count, instance_count, first_vertex,
 			first_instance, target_width, target_height);
+	const bool auto_learned = auto_shape && has_learned_nonindexed_candidate(hashes,
+		vertex_count, instance_count, first_vertex, first_instance);
+	if (auto_learned)
+		remember_confirmed_scene_target(context);
 	if (!g.replay_capture_active) {
 		if (blend != nullptr) blend->Release();
 		if (rtv != nullptr) rtv->Release();
@@ -3010,8 +3052,6 @@ bool on_draw(command_list *cmd_list, uint32_t vertex_count, uint32_t instance_co
 	}
 	const bool configured = is_configured_nonindexed_rule(hashes, vertex_count, instance_count,
 		first_vertex, first_instance, rtv, dsv, blend);
-	const bool auto_learned = auto_shape && has_learned_nonindexed_candidate(hashes,
-		vertex_count, instance_count, first_vertex, first_instance);
 	if (configured || auto_learned) {
 		const bool replayed = replay_nonindexed_composite_draw(cmd_list, vertex_count,
 			instance_count, first_vertex, first_instance, hashes.pixel, hashes.vertex);
@@ -3923,6 +3963,7 @@ void on_destroy_device(device *) {
 	g.replay_capture_active = false;
 	reset_replay_frame_state();
 	g.learned_scene_targets.clear();
+	g.confirmed_scene_targets.clear();
 	g.replay = {};
 }
 

@@ -675,6 +675,24 @@ test('final highlight candidates are learned from draw state across arbitrary re
   assert.match(source, /auto_highlight learned non-indexed candidate/)
 })
 
+test('confirmed final highlight refreshes the scene target without a resolution gate', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const callback = source.match(/bool on_draw\([^]*?\n\}/)?.[0] ?? ''
+  const remember = source.match(/void remember_confirmed_scene_target\([^]*?\n\}/)?.[0] ?? ''
+  const learnedStart = source.indexOf('bool current_render_target_is_learned(ID3D11DeviceContext *context) {')
+  const learnedEnd = source.indexOf('\n}', learnedStart)
+  const learned = source.slice(learnedStart, learnedEnd + 2)
+
+  assert.match(callback, /const bool auto_learned = auto_shape && has_learned_nonindexed_candidate/)
+  assert.ok(callback.indexOf('remember_confirmed_scene_target(') <
+    callback.indexOf('if (!g.replay_capture_active)'))
+  assert.match(remember, /g\.confirmed_scene_targets/)
+  assert.match(remember, /constexpr size_t max_recent_targets = 4/)
+  assert.match(remember, /scene target refreshed from confirmed final highlight/)
+  assert.doesNotMatch(remember, /Width|Height|get_screenshot_width_and_height/)
+  assert.match(learned, /g\.confirmed_scene_targets/)
+})
+
 test('later composites reuse the captured scene across render-target size changes', () => {
   const source = read('./NS_AlphaCapture.cpp')
   const replay = source.match(/bool replay_nonindexed_composite_draw\([^]*?\n\}/)?.[0] ?? ''
