@@ -170,6 +170,11 @@ struct replay_resources {
 	ComPtr<ID3D11ShaderResourceView> scene_black_srv;
 	ComPtr<ID3D11Texture2D> scene_white_texture;
 	ComPtr<ID3D11ShaderResourceView> scene_white_srv;
+	ComPtr<ID3D11Texture2D> lens_gradient_texture;
+	ComPtr<ID3D11RenderTargetView> lens_gradient_rtv;
+	ComPtr<ID3D11Texture2D> lens_support_texture;
+	ComPtr<ID3D11RenderTargetView> lens_support_rtv;
+	ComPtr<ID3D11ShaderResourceView> lens_support_srv;
 	ComPtr<ID3D11BlendState> alpha_blend;
 	ComPtr<ID3D11BlendState> additive_blend;
 	ComPtr<ID3D11BlendState> opaque_blend;
@@ -201,7 +206,9 @@ struct state {
 	std::vector<ns_alpha_rules::nonindexed_rule> nonindexed_rules;
 	std::vector<shader_candidate> shader_candidates;
 	std::vector<nonindexed_candidate> nonindexed_candidates;
+	std::vector<nonindexed_candidate> hunting_nonindexed_candidates;
 	bool shader_selector_active = false;
+	bool shader_selector_skip_present = false;
 	ns_alpha_rules::preview_state preview;
 	int group_editor_index = -1;
 	ns_alpha_rules::rule_group group_editor_work;
@@ -224,12 +231,18 @@ struct state {
 	uint32_t replay_nonindexed_draw_count = 0;
 	uint32_t replay_clear_count = 0;
 	uint64_t replay_frame_target_resource = 0;
+	bool lens_diagnostic_logged = false;
+	bool lens_gradient_valid = false;
+	uint32_t lens_probe_draw_count = 0;
+	uint32_t lens_color_probe_draw_count = 0;
 	std::vector<ComPtr<ID3D11Resource>> learned_scene_targets;
 	std::vector<ComPtr<ID3D11Resource>> confirmed_scene_targets;
 	bool locale_zh = false;
 	int hotkey_capture_target = 0;
 	uint32_t hotkey_modifier_latch = ns_white_backing::modifier_none;
 	uint32_t hotkey_suppress_key = 0;
+	uint32_t hotkey_pending_key = 0;
+	uint32_t hotkey_pending_modifiers = ns_white_backing::modifier_none;
 	std::array<char, 1024> output_path_input = {};
 	std::array<char, 512> file_naming_input = {};
 };
@@ -688,6 +701,48 @@ bool has_learned_nonindexed_candidate(const shader_hashes &hashes, uint32_t vert
 			return true;
 	}
 	return false;
+}
+
+void record_hunting_nonindexed_candidate(const shader_hashes &hashes,
+	uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
+	uint32_t first_instance, ID3D11RenderTargetView *rtv) {
+	if (hashes.pixel == 0 && hashes.vertex == 0)
+		return;
+	uint32_t width = 0;
+	uint32_t height = 0;
+	if (rtv != nullptr) {
+		ComPtr<ID3D11Resource> resource;
+		rtv->GetResource(&resource);
+		ComPtr<ID3D11Texture2D> texture;
+		if (resource != nullptr && SUCCEEDED(resource.As(&texture))) {
+			D3D11_TEXTURE2D_DESC desc = {};
+			texture->GetDesc(&desc);
+			width = desc.Width;
+			height = desc.Height;
+		}
+	}
+	for (nonindexed_candidate &candidate : g.hunting_nonindexed_candidates) {
+		if (candidate.pixel == hashes.pixel && candidate.vertex == hashes.vertex &&
+			candidate.vertex_count == vertex_count && candidate.instance_count == instance_count &&
+			candidate.first_vertex == first_vertex && candidate.first_instance == first_instance &&
+			candidate.width == width && candidate.height == height) {
+			++candidate.draw_count;
+			return;
+		}
+	}
+	if (g.hunting_nonindexed_candidates.size() >= 256)
+		return;
+	nonindexed_candidate candidate;
+	candidate.pixel = hashes.pixel;
+	candidate.vertex = hashes.vertex;
+	candidate.vertex_count = vertex_count;
+	candidate.instance_count = instance_count;
+	candidate.first_vertex = first_vertex;
+	candidate.first_instance = first_instance;
+	candidate.width = width;
+	candidate.height = height;
+	candidate.draw_count = 1;
+	g.hunting_nonindexed_candidates.push_back(candidate);
 }
 
 bool read_reshade_setting(const char *section, const char *key, std::string &value) {
@@ -1648,6 +1703,9 @@ bool ensure_replay_resources(ID3D11DeviceContext *context,
 
 	if (g.replay.black_texture != nullptr && g.replay.white_texture != nullptr &&
 		g.replay.scene_black_texture != nullptr && g.replay.scene_white_texture != nullptr &&
+		g.replay.lens_gradient_texture != nullptr && g.replay.lens_gradient_rtv != nullptr &&
+		g.replay.lens_support_texture != nullptr && g.replay.lens_support_rtv != nullptr &&
+		g.replay.lens_support_srv != nullptr &&
 		g.replay.device.Get() == device.Get() &&
 		g.replay.width == original_desc.Width && g.replay.height == original_desc.Height &&
 		g.replay.sample_count == depth_desc.SampleDesc.Count &&
@@ -1686,6 +1744,12 @@ bool ensure_replay_resources(ID3D11DeviceContext *context,
 	if (FAILED(result)) { error = "private black scene SRV texture creation failed"; return false; }
 	result = device->CreateTexture2D(&scene_desc, nullptr, &fresh.scene_white_texture);
 	if (FAILED(result)) { error = "private white scene SRV texture creation failed"; return false; }
+	D3D11_TEXTURE2D_DESC gradient_desc = capture_desc;
+	gradient_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+	result = device->CreateTexture2D(&gradient_desc, nullptr, &fresh.lens_gradient_texture);
+	if (FAILED(result)) { error = "private lens gradient texture creation failed"; return false; }
+	result = device->CreateTexture2D(&gradient_desc, nullptr, &fresh.lens_support_texture);
+	if (FAILED(result)) { error = "private lens support texture creation failed"; return false; }
 	D3D11_RENDER_TARGET_VIEW_DESC view_desc = {};
 	view_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
 	view_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
@@ -1693,6 +1757,12 @@ bool ensure_replay_resources(ID3D11DeviceContext *context,
 	if (FAILED(result)) { error = "private black RGBA32F RTV creation failed"; return false; }
 	result = device->CreateRenderTargetView(fresh.white_texture.Get(), &view_desc, &fresh.white_rtv);
 	if (FAILED(result)) { error = "private white RGBA32F RTV creation failed"; return false; }
+	result = device->CreateRenderTargetView(fresh.lens_gradient_texture.Get(), &view_desc,
+		&fresh.lens_gradient_rtv);
+	if (FAILED(result)) { error = "private lens gradient RTV creation failed"; return false; }
+	result = device->CreateRenderTargetView(fresh.lens_support_texture.Get(), &view_desc,
+		&fresh.lens_support_rtv);
+	if (FAILED(result)) { error = "private lens support RTV creation failed"; return false; }
 	D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
 	srv_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
 	srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -1705,6 +1775,9 @@ bool ensure_replay_resources(ID3D11DeviceContext *context,
 	if (FAILED(result)) { error = "private black scene SRV creation failed"; return false; }
 	result = device->CreateShaderResourceView(fresh.scene_white_texture.Get(), &srv_desc, &fresh.scene_white_srv);
 	if (FAILED(result)) { error = "private white scene SRV creation failed"; return false; }
+	result = device->CreateShaderResourceView(fresh.lens_support_texture.Get(), &srv_desc,
+		&fresh.lens_support_srv);
+	if (FAILED(result)) { error = "private lens support SRV creation failed"; return false; }
 	if (!make_replay_blend_states(device.Get(), fresh, error))
 		return false;
 
@@ -1807,12 +1880,22 @@ void initialize_replay_targets(ID3D11DeviceContext *context, uint64_t original_r
 	context->ClearRenderTargetView(g.replay.black_rtv.Get(), black_clear);
 	context->ClearRenderTargetView(g.replay.white_rtv.Get(), white_clear);
 	copy_scene_color_substitutes(context);
+	if (g.replay.lens_gradient_rtv != nullptr && g.replay.lens_support_rtv != nullptr) {
+		// Keep one neutral canvas for all lens draws in this frame. Clearing inside
+		// replay_color_draw would discard an earlier lens (for example, the second
+		// eyeglass lens) before export.
+		const float neutral_clear[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+		context->ClearRenderTargetView(g.replay.lens_gradient_rtv.Get(), neutral_clear);
+		context->ClearRenderTargetView(g.replay.lens_support_rtv.Get(), neutral_clear);
+	}
 	g.replay_frame_started = true;
 	g.replay_frame_target_resource = original_resource_id;
 	g.replay_frame_has_draws = false;
 	g.replay_draw_count = 0;
 	g.replay_nonindexed_draw_count = 0;
 	g.replay_clear_count = 0;
+	g.lens_diagnostic_logged = false;
+	g.lens_gradient_valid = false;
 }
 
 bool mirror_scene_draw(command_list *cmd_list, uint32_t index_count,
@@ -1892,6 +1975,10 @@ struct saved_lens_srv {
 	ID3D11ShaderResourceView *view = nullptr;
 };
 
+// The confirmed FFXIV gradient-lens draw samples the composited scene from PS t2.
+// t0 is another same-size render target bound by the material and must remain untouched.
+constexpr UINT lens_scene_color_slot = 2;
+
 bool is_lens_scene_color_format(DXGI_FORMAT format) {
 	switch (format) {
 	case DXGI_FORMAT_R16G16B16A16_FLOAT:
@@ -1899,14 +1986,17 @@ bool is_lens_scene_color_format(DXGI_FORMAT format) {
 	case DXGI_FORMAT_R11G11B10_FLOAT:
 	case DXGI_FORMAT_R10G10B10A2_UNORM:
 	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
 	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
 		return true;
 	default:
 		return false;
 	}
 }
 
-bool lens_scene_srv_matches(ID3D11ShaderResourceView *view, UINT width, UINT height) {
+bool lens_scene_srv_matches(ID3D11ShaderResourceView *view, UINT width, UINT height,
+	bool allow_half_resolution = false) {
 	if (view == nullptr)
 		return false;
 	ComPtr<ID3D11Resource> resource;
@@ -1916,20 +2006,24 @@ bool lens_scene_srv_matches(ID3D11ShaderResourceView *view, UINT width, UINT hei
 		return false;
 	D3D11_TEXTURE2D_DESC description = {};
 	texture->GetDesc(&description);
-	return description.Width == width && description.Height == height &&
+	const bool exact_size = description.Width == width && description.Height == height;
+	const bool half_size = allow_half_resolution && description.Width * 2 == width &&
+		description.Height * 2 == height;
+	return (exact_size || half_size) &&
 		description.ArraySize == 1 && description.SampleDesc.Count == 1 &&
 		is_lens_scene_color_format(description.Format);
 }
 
 void bind_lens_scene_srvs(ID3D11DeviceContext *context, ID3D11ShaderResourceView *replacement,
-	std::vector<saved_lens_srv> &saved, UINT width, UINT height, bool capture_original) {
+	std::vector<saved_lens_srv> &saved, UINT width, UINT height, bool capture_original,
+	bool allow_half_resolution = false) {
 	if (context == nullptr || replacement == nullptr)
 		return;
-	for (UINT slot = 0; slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+	for (UINT slot = lens_scene_color_slot; slot == lens_scene_color_slot; ++slot) {
 		if (capture_original) {
 			ID3D11ShaderResourceView *current = nullptr;
 			context->PSGetShaderResources(slot, 1, &current);
-			if (!lens_scene_srv_matches(current, width, height)) {
+			if (!lens_scene_srv_matches(current, width, height, allow_half_resolution)) {
 				if (current != nullptr) current->Release();
 				continue;
 			}
@@ -1953,6 +2047,36 @@ void restore_lens_scene_srvs(ID3D11DeviceContext *context, std::vector<saved_len
 			entry.view->Release();
 	}
 	saved.clear();
+}
+
+UINT query_lens_scene_srv_count(ID3D11DeviceContext *context) {
+	if (context == nullptr)
+		return 0;
+	ID3D11RenderTargetView *rtv = nullptr;
+	context->OMGetRenderTargets(1, &rtv, nullptr);
+	ComPtr<ID3D11Resource> rtv_resource;
+	ComPtr<ID3D11Texture2D> rtv_texture;
+	if (rtv != nullptr)
+		rtv->GetResource(&rtv_resource);
+	if (rtv_resource != nullptr)
+		rtv_resource.As(&rtv_texture);
+	D3D11_TEXTURE2D_DESC rtv_desc = {};
+	if (rtv_texture != nullptr)
+		rtv_texture->GetDesc(&rtv_desc);
+	if (rtv != nullptr)
+		rtv->Release();
+	if (rtv_desc.Width == 0 || rtv_desc.Height == 0)
+		return 0;
+
+	ID3D11ShaderResourceView *views[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
+	context->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, views);
+	const UINT count = views[lens_scene_color_slot] != nullptr &&
+		lens_scene_srv_matches(views[lens_scene_color_slot], rtv_desc.Width,
+			rtv_desc.Height, true) ? 1u : 0u;
+	for (ID3D11ShaderResourceView *view : views)
+		if (view != nullptr)
+			view->Release();
+	return count;
 }
 
 bool replay_color_draw(command_list *cmd_list, uint32_t index_count,
@@ -2036,6 +2160,33 @@ bool replay_color_draw(command_list *cmd_list, uint32_t index_count,
 	context->OMSetBlendState(replay_blend, original_factor, original_sample_mask);
 	context->OMSetDepthStencilState(replay_depth_state.Get(), original_stencil_ref);
 	std::vector<saved_lens_srv> lens_scene_srvs;
+	if (lens_only && g.replay.lens_gradient_texture != nullptr &&
+		g.replay.lens_gradient_rtv != nullptr && g.replay.lens_support_rtv != nullptr &&
+		g.replay.lens_support_srv != nullptr) {
+		// The game lens shader only reveals its gradient over a non-empty support
+		// surface. Render one extra copy over the captured white underlay, then use
+		// the ordinary black/white pair below for the actual alpha estimate.
+		ID3D11ShaderResourceView *original_scene_srv = nullptr;
+		context->PSGetShaderResources(lens_scene_color_slot, 1, &original_scene_srv);
+		ID3D11ShaderResourceView *support_srv = g.replay.lens_support_srv.Get();
+		context->PSSetShaderResources(lens_scene_color_slot, 1, &support_srv);
+		ID3D11RenderTargetView *gradient_rtv = g.replay.lens_gradient_rtv.Get();
+		context->OMSetRenderTargetsAndUnorderedAccessViews(1, &gradient_rtv, original_dsv,
+			1, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, nullptr, nullptr);
+		context->OMSetBlendState(g.replay.opaque_blend.Get(), original_factor, original_sample_mask);
+		context->OMSetDepthStencilState(replay_depth_state.Get(), original_stencil_ref);
+		++g_replay_depth;
+		context->DrawIndexedInstanced(index_count, instance_count, first_index,
+			vertex_offset, first_instance);
+		--g_replay_depth;
+		context->PSSetShaderResources(lens_scene_color_slot, 1, &original_scene_srv);
+		if (original_scene_srv != nullptr)
+			original_scene_srv->Release();
+		g.lens_gradient_valid = true;
+		log_line("lens gradient support replayed slot=%u", lens_scene_color_slot);
+		context->OMSetBlendState(replay_blend, original_factor, original_sample_mask);
+		context->OMSetDepthStencilState(replay_depth_state.Get(), original_stencil_ref);
+	}
 	ID3D11RenderTargetView *replay_rtv = g.replay.black_rtv.Get();
 	context->OMSetRenderTargetsAndUnorderedAccessViews(1, &replay_rtv, original_dsv,
 		1, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, nullptr, nullptr);
@@ -2044,7 +2195,7 @@ bool replay_color_draw(command_list *cmd_list, uint32_t index_count,
 		// already-composited private backgrounds before binding the replacement SRVs.
 		copy_scene_color_substitutes(context);
 		bind_lens_scene_srvs(context, g.replay.scene_black_srv.Get(), lens_scene_srvs,
-			g.replay.width, g.replay.height, true);
+			g.replay.width, g.replay.height, true, true);
 	}
 	if (lens_only)
 		log_line("lens scene SRVs substituted slots=%u", static_cast<unsigned>(lens_scene_srvs.size()));
@@ -2078,7 +2229,7 @@ bool replay_color_draw(command_list *cmd_list, uint32_t index_count,
 		1, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, nullptr, nullptr);
 	if (lens_only)
 		bind_lens_scene_srvs(context, g.replay.scene_white_srv.Get(), lens_scene_srvs,
-			g.replay.width, g.replay.height, false);
+			g.replay.width, g.replay.height, false, true);
 	context->DrawIndexedInstanced(index_count, instance_count, first_index,
 		vertex_offset, first_instance);
 	if (lens_only)
@@ -2148,17 +2299,12 @@ bool replay_nonindexed_composite_draw(command_list *cmd_list, uint32_t vertex_co
 			if (rtv != nullptr) rtv->Release();
 		return false;
 	}
-	ComPtr<ID3D11Resource> target_resource;
-	original_rtvs[0]->GetResource(&target_resource);
-	ComPtr<ID3D11Texture2D> target_texture;
-	D3D11_TEXTURE2D_DESC target_desc = {};
-	if (target_resource != nullptr && SUCCEEDED(target_resource.As(&target_texture)))
-		target_texture->GetDesc(&target_desc);
-	const bool reuse_captured_scene = g.replay_frame_started;
-	if (reuse_captured_scene && target_desc.Width != 0 && target_desc.Height != 0 &&
-		(g.replay.width != target_desc.Width || g.replay.height != target_desc.Height))
-		log_line("non-indexed composite target=%ux%u reusing captured scene=%ux%u without reset",
-			target_desc.Width, target_desc.Height, g.replay.width, g.replay.height);
+	const uint64_t original_resource_id = render_target_resource_id(original_rtvs[0]);
+	const bool reuse_captured_scene = g.replay_frame_started &&
+		g.replay_frame_target_resource == original_resource_id;
+	if (g.replay_frame_started && !reuse_captured_scene)
+		log_line("resolution/render-target change detected target=0x%llX; resetting replay scene",
+			static_cast<unsigned long long>(original_resource_id));
 	ID3D11DepthStencilState *original_depth_state = nullptr;
 	UINT original_stencil_ref = 0;
 	context->OMGetDepthStencilState(&original_depth_state, &original_stencil_ref);
@@ -2176,7 +2322,6 @@ bool replay_nonindexed_composite_draw(command_list *cmd_list, uint32_t vertex_co
 		return false;
 	}
 	const UINT restore_count = replay_restore_rtv_count(original_rtvs);
-	const uint64_t original_resource_id = render_target_resource_id(original_rtvs[0]);
 	if (!reuse_captured_scene)
 		initialize_replay_targets(context, original_resource_id);
 	context->OMSetBlendState(original_blend, original_factor, original_sample_mask);
@@ -2380,6 +2525,48 @@ rgba_image reconstruct_black_white_rgba(const rgba32f_image &black,
 	return image;
 }
 
+void apply_lens_gradient_override(rgba_image &image, const rgba32f_image &gradient,
+	const rgba32f_image &support, const rgba_image *underlay = nullptr) {
+	if (image.width != gradient.width || image.height != gradient.height ||
+		gradient.pixels.size() != support.pixels.size())
+		return;
+	for (size_t index = 0; index < gradient.pixels.size(); index += 4) {
+		const float difference = std::max({
+			std::abs(gradient.pixels[index + 0] - support.pixels[index + 0]),
+			std::abs(gradient.pixels[index + 1] - support.pixels[index + 1]),
+			std::abs(gradient.pixels[index + 2] - support.pixels[index + 2]) });
+		if (difference < 0.003f)
+			continue;
+		const float required_alpha = std::max({
+			clamp_unit(support.pixels[index + 0] - gradient.pixels[index + 0]),
+			clamp_unit(support.pixels[index + 1] - gradient.pixels[index + 1]),
+			clamp_unit(support.pixels[index + 2] - gradient.pixels[index + 2]) });
+		const float lens_alpha = clamp_unit(std::max(0.15f,
+			std::max(required_alpha, difference)));
+		// The gradient replay is the lens shader evaluated over a neutral white
+		// support. Recover the isolated lens contribution, then composite it over
+		// the scene saved immediately before the lens draw. Using the already
+		// composited image as the base would erase the face behind an opaque lens.
+		const size_t base_index = index;
+		const rgba_image &base_image = underlay != nullptr ? *underlay : image;
+		float base_alpha = base_image.pixels[base_index + 3] / 255.0f;
+		float base_premul[3] = {};
+		for (size_t channel = 0; channel < 3; ++channel)
+			base_premul[channel] = (base_image.pixels[base_index + channel] / 255.0f) * base_alpha;
+		float out_premul[3] = {};
+		for (size_t channel = 0; channel < 3; ++channel) {
+			const float lens_premul = clamp_unit(gradient.pixels[index + channel] -
+				support.pixels[index + channel] * (1.0f - lens_alpha));
+			out_premul[channel] = lens_premul + base_premul[channel] * (1.0f - lens_alpha);
+		}
+		const float out_alpha = clamp_unit(lens_alpha + base_alpha * (1.0f - lens_alpha));
+		for (size_t channel = 0; channel < 3; ++channel)
+			image.pixels[index + channel] = static_cast<uint8_t>(std::lround(
+				clamp_unit(out_alpha > 0.000001f ? out_premul[channel] / out_alpha : 0.0f) * 255.0f));
+		image.pixels[index + 3] = static_cast<uint8_t>(std::lround(out_alpha * 255.0f));
+	}
+}
+
 bool capture_lens_effect_outputs(effect_runtime *runtime, const std::wstring &prefix,
 	std::string &error) {
 	rgba_image composite;
@@ -2439,7 +2626,30 @@ bool capture_replay_outputs(effect_runtime *runtime) {
 		return capture_failure(error);
 	if (black_raw.width != white_raw.width || black_raw.height != white_raw.height)
 		return capture_failure("black/white replay target dimensions differ");
-	const rgba_image rgba = reconstruct_black_white_rgba(black_raw, white_raw);
+	rgba_image rgba = reconstruct_black_white_rgba(black_raw, white_raw);
+	if (g.lens_gradient_valid) {
+		rgba32f_image gradient_raw;
+		rgba32f_image support_raw;
+		if (read_replay_rgba32f(g.replay.lens_gradient_texture.Get(), gradient_raw, error) &&
+			read_replay_rgba32f(g.replay.lens_support_texture.Get(), support_raw, error)) {
+			rgba_image underlay;
+			rgba32f_image underlay_black_raw;
+			rgba32f_image underlay_white_raw;
+			const rgba_image *underlay_ptr = nullptr;
+			if (read_replay_rgba32f(g.replay.scene_black_texture.Get(), underlay_black_raw, error) &&
+				read_replay_rgba32f(g.replay.scene_white_texture.Get(), underlay_white_raw, error) &&
+				underlay_black_raw.width == black_raw.width &&
+				underlay_black_raw.height == black_raw.height &&
+				underlay_white_raw.width == black_raw.width &&
+				underlay_white_raw.height == black_raw.height) {
+				underlay = reconstruct_black_white_rgba(underlay_black_raw, underlay_white_raw);
+				underlay_ptr = &underlay;
+				log_line("lens gradient underlay restored from pre-lens scene");
+			}
+			apply_lens_gradient_override(rgba, gradient_raw, support_raw, underlay_ptr);
+			log_line("lens gradient color restored from neutral support replay");
+		}
+	}
 	uint64_t black_nonzero_pixels = 0;
 	uint64_t white_nonwhite_pixels = 0;
 	uint64_t alpha_nontrivial_pixels = 0;
@@ -2710,7 +2920,8 @@ uint64_t current_render_target_resource_id(ID3D11DeviceContext *context) {
 }
 
 bool current_render_target_is_learned(ID3D11DeviceContext *context) {
-	if (context == nullptr || g.learned_scene_targets.empty())
+	if (context == nullptr ||
+		(g.learned_scene_targets.empty() && g.confirmed_scene_targets.empty()))
 		return false;
 	ID3D11RenderTargetView *rtv = nullptr;
 	context->OMGetRenderTargets(1, &rtv, nullptr);
@@ -2789,9 +3000,9 @@ void record_shader_candidate(ID3D11DeviceContext *context, const shader_hashes &
 	const draw_arguments &arguments) {
 	if (!g.shader_selector_active || context == nullptr)
 		return;
-	const uint64_t render_target = current_render_target_resource_id(context);
-	if (render_target == 0)
+	if (hashes.pixel == 0 && hashes.vertex == 0)
 		return;
+	const uint64_t render_target = current_render_target_resource_id(context);
 	for (shader_candidate &candidate : g.shader_candidates) {
 		if (candidate.render_target == render_target && candidate.rule.pixel == hashes.pixel &&
 			candidate.rule.vertex == hashes.vertex &&
@@ -2813,6 +3024,98 @@ void record_shader_candidate(ID3D11DeviceContext *context, const shader_hashes &
 	candidate.draw_count = 1;
 	candidate.render_target = render_target;
 	g.shader_candidates.push_back(std::move(candidate));
+}
+
+bool query_probe_color_state(ID3D11DeviceContext *context, UINT &format, bool &has_dsv,
+	bool &blend_enabled, UINT &write_mask) {
+	format = 0;
+	has_dsv = false;
+	blend_enabled = false;
+	write_mask = 0;
+	if (context == nullptr)
+		return false;
+	ID3D11RenderTargetView *rtv = nullptr;
+	ID3D11DepthStencilView *dsv = nullptr;
+	context->OMGetRenderTargets(1, &rtv, &dsv);
+	ID3D11BlendState *blend = nullptr;
+	FLOAT factor[4] = {};
+	UINT sample_mask = 0;
+	context->OMGetBlendState(&blend, factor, &sample_mask);
+	D3D11_BLEND_DESC blend_desc = {};
+	if (blend != nullptr)
+		blend->GetDesc(&blend_desc);
+	blend_enabled = blend_desc.RenderTarget[0].BlendEnable != FALSE;
+	write_mask = blend_desc.RenderTarget[0].RenderTargetWriteMask;
+	has_dsv = dsv != nullptr;
+	ComPtr<ID3D11Resource> resource;
+	ComPtr<ID3D11Texture2D> texture;
+	if (rtv != nullptr)
+		rtv->GetResource(&resource);
+	if (resource != nullptr)
+		resource.As(&texture);
+	D3D11_TEXTURE2D_DESC description = {};
+	const bool has_rtv = rtv != nullptr;
+	if (texture != nullptr) {
+		texture->GetDesc(&description);
+		format = static_cast<UINT>(description.Format);
+	}
+	if (blend != nullptr)
+		blend->Release();
+	if (rtv != nullptr)
+		rtv->Release();
+	if (dsv != nullptr)
+		dsv->Release();
+	return has_rtv;
+}
+
+std::string query_probe_scene_srv_slots(ID3D11DeviceContext *context) {
+	if (context == nullptr)
+		return "none";
+	ID3D11RenderTargetView *rtv = nullptr;
+	context->OMGetRenderTargets(1, &rtv, nullptr);
+	ComPtr<ID3D11Resource> rtv_resource;
+	ComPtr<ID3D11Texture2D> rtv_texture;
+	if (rtv != nullptr)
+		rtv->GetResource(&rtv_resource);
+	if (rtv_resource != nullptr)
+		rtv_resource.As(&rtv_texture);
+	D3D11_TEXTURE2D_DESC rtv_desc = {};
+	if (rtv_texture != nullptr)
+		rtv_texture->GetDesc(&rtv_desc);
+	if (rtv != nullptr)
+		rtv->Release();
+	if (rtv_desc.Width == 0 || rtv_desc.Height == 0)
+		return "none";
+
+	ID3D11ShaderResourceView *views[ D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT ] = {};
+	context->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, views);
+	std::string result;
+	for (UINT slot = 0; slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+		ID3D11ShaderResourceView *view = views[slot];
+		if (view == nullptr)
+			continue;
+		ComPtr<ID3D11Resource> resource;
+		ComPtr<ID3D11Texture2D> texture;
+		view->GetResource(&resource);
+		if (resource != nullptr)
+			resource.As(&texture);
+		D3D11_TEXTURE2D_DESC desc = {};
+		if (texture != nullptr)
+			texture->GetDesc(&desc);
+		const bool exact_size = desc.Width == rtv_desc.Width && desc.Height == rtv_desc.Height;
+		const bool half_size = desc.Width * 2 == rtv_desc.Width && desc.Height * 2 == rtv_desc.Height;
+		if ((exact_size || half_size) && desc.ArraySize == 1 && desc.SampleDesc.Count == 1 &&
+			is_lens_scene_color_format(desc.Format)) {
+			if (!result.empty())
+				result += ",";
+			result += "t" + std::to_string(slot) + ":" +
+			(exact_size ? "exact" : "half") + ":" +
+			std::to_string(desc.Width) + "x" + std::to_string(desc.Height) +
+			"/" + std::to_string(static_cast<UINT>(desc.Format));
+		}
+		view->Release();
+	}
+	return result.empty() ? "none" : result;
 }
 
 bool query_color_replay_state(ID3D11DeviceContext *context, const mesh_signature &mesh,
@@ -2894,6 +3197,11 @@ bool query_lens_replay_state(ID3D11DeviceContext *context, const mesh_signature 
 		rtv_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
 		rtv_desc.SampleDesc.Count == 1 && blend_desc.RenderTargetWriteMask == 0x07 &&
 		!blend_desc.BlendEnable;
+	log_line("lens replay state format=%u size=%ux%u samples=%u dsv=%u blend=%u mask=0x%X result=%u",
+		static_cast<unsigned>(rtv_desc.Format), rtv_desc.Width, rtv_desc.Height,
+		rtv_desc.SampleDesc.Count, dsv != nullptr ? 1u : 0u,
+		blend_desc.BlendEnable ? 1u : 0u,
+		static_cast<unsigned>(blend_desc.RenderTargetWriteMask), result ? 1u : 0u);
 	if (texture != nullptr) texture->Release();
 	if (resource != nullptr) resource->Release();
 	if (rtv != nullptr) rtv->Release();
@@ -2913,6 +3221,11 @@ bool is_lens_target(const shader_hashes &hashes, const mesh_signature &mesh) {
 		mesh.index_count == g.cfg.lens_index_count && mesh.vertex_offset == 0;
 }
 
+bool is_runtime_lens_target(ID3D11DeviceContext *context, const shader_hashes &hashes) {
+	return g.cfg.lens_capture && hashes.pixel == g.cfg.lens_pixel_shader_hash &&
+		query_lens_scene_srv_count(context) != 0;
+}
+
 bool on_draw_indexed(command_list *cmd_list, uint32_t index_count, uint32_t instance_count,
 	uint32_t first_index, int32_t vertex_offset, uint32_t first_instance) {
 	if (cmd_list == nullptr || g_replay_depth != 0)
@@ -2923,29 +3236,85 @@ bool on_draw_indexed(command_list *cmd_list, uint32_t index_count, uint32_t inst
 	ID3D11DeviceContext *context = reinterpret_cast<ID3D11DeviceContext *>(
 		cmd_list->get_native());
 	record_shader_candidate(context, hashes, arguments);
-	if (!g.replay_capture_active && g.preview.active &&
+	if (g.replay_capture_active && g.lens_probe_draw_count < 128) {
+		log_line("capture indexed probe ps=%u vs=%u first=%u count=%u vertex_offset=%d",
+			hashes.pixel, hashes.vertex, first_index, index_count, vertex_offset);
+		++g.lens_probe_draw_count;
+	}
+	if (g.replay_capture_active && g.lens_color_probe_draw_count < 64) {
+		UINT format = 0;
+		UINT write_mask = 0;
+		bool has_dsv = false;
+		bool blend_enabled = false;
+		if (query_probe_color_state(context, format, has_dsv, blend_enabled, write_mask) &&
+			write_mask != 0) {
+			const std::string srv_slots = query_probe_scene_srv_slots(context);
+			log_line("capture color probe ps=%u vs=%u first=%u count=%u vertex_offset=%d format=%u dsv=%u blend=%u mask=0x%X srv=%s",
+				hashes.pixel, hashes.vertex, first_index, index_count, vertex_offset,
+				format, has_dsv ? 1u : 0u, blend_enabled ? 1u : 0u, write_mask,
+				srv_slots.c_str());
+			++g.lens_color_probe_draw_count;
+		}
+	}
+	if (g.preview.active &&
 		ns_alpha_rules::preview_hides_draw(g.preview, g.rule_groups, hashes.pixel,
 			hashes.vertex, first_index, index_count, vertex_offset))
 		return true;
 	if (g.replay_capture_active && g.cfg.lens_capture) {
-		mesh_signature lens_mesh;
-		if (query_mesh_signature(context, arguments, lens_mesh) &&
-			is_lens_target(hashes, lens_mesh) && query_lens_replay_state(context, lens_mesh)) {
-			return replay_color_draw(cmd_list, index_count, instance_count, first_index,
-				vertex_offset, first_instance, hashes.pixel, true);
+		if (first_index == g.cfg.lens_first_index && index_count == g.cfg.lens_index_count &&
+			!g.lens_diagnostic_logged) {
+			log_line("lens candidate observed ps=%u expected_ps=%u vs=%u first=%u count=%u vertex_offset=%d",
+				hashes.pixel, g.cfg.lens_pixel_shader_hash, hashes.vertex, first_index,
+				index_count, vertex_offset);
+			g.lens_diagnostic_logged = true;
 		}
 	}
 	const bool configured = is_configured_shader_rule(hashes, index_count, first_index,
 		vertex_offset);
 	if (configured) {
 		mesh_signature configured_mesh;
-		bool configured_additive = false;
-		if (query_mesh_signature(context, arguments, configured_mesh) &&
-			query_color_replay_state(context, configured_mesh, configured_additive)) {
-			remember_current_render_target(context);
-			if (g.replay_capture_active)
+		if (g.replay_capture_active && query_mesh_signature(context, arguments, configured_mesh)) {
+			const bool configured_lens = configured && g.cfg.lens_capture &&
+				(is_lens_target(hashes, configured_mesh) ||
+					(hashes.pixel == g.cfg.lens_pixel_shader_hash &&
+						query_lens_scene_srv_count(context) != 0));
+			if (configured_lens) {
+				if (query_lens_replay_state(context, configured_mesh)) {
+					remember_current_render_target(context);
+					log_line("configured lens rule takes precedence ps=%u vs=%u first=%u count=%u",
+						hashes.pixel, hashes.vertex, first_index, index_count);
+					return replay_color_draw(cmd_list, index_count, instance_count, first_index,
+						vertex_offset, first_instance, hashes.pixel, true);
+				}
+				// A configured lens draw must never fall through to ordinary replay. If its
+				// state is not usable, leave the original draw intact for this frame.
+				log_line("configured lens rule skipped ps=%u: lens replay state unavailable",
+					hashes.pixel);
+				return false;
+			}
+			bool configured_additive = false;
+			if (query_color_replay_state(context, configured_mesh, configured_additive)) {
+				remember_current_render_target(context);
 				return replay_color_draw(cmd_list, index_count, instance_count, first_index,
 					vertex_offset, first_instance, hashes.pixel, false);
+			}
+		}
+	}
+	if (g.replay_capture_active && g.cfg.lens_capture && !configured) {
+		mesh_signature lens_mesh;
+		if (query_mesh_signature(context, arguments, lens_mesh)) {
+			const bool legacy_lens_target = is_lens_target(hashes, lens_mesh);
+			const bool runtime_lens_target = !legacy_lens_target &&
+				is_runtime_lens_target(context, hashes);
+			if ((legacy_lens_target || runtime_lens_target) &&
+				query_lens_replay_state(context, lens_mesh)) {
+				if (runtime_lens_target)
+					log_line("lens runtime target observed ps=%u vs=%u first=%u count=%u scene_srvs=%u",
+						hashes.pixel, hashes.vertex, first_index, index_count,
+						query_lens_scene_srv_count(context));
+			return replay_color_draw(cmd_list, index_count, instance_count, first_index,
+					vertex_offset, first_instance, hashes.pixel, true);
+			}
 		}
 	}
 	if (g.cfg.auto_match) {
@@ -2987,11 +3356,15 @@ bool on_draw_indexed(command_list *cmd_list, uint32_t index_count, uint32_t inst
 		if (!g.replay_capture_active)
 			return false;
 		mesh_signature mesh;
-		bool additive = false;
-		if (query_mesh_signature(context, arguments, mesh) && learned_mesh(mesh) &&
-			query_color_replay_state(context, mesh, additive)) {
-			return replay_color_draw(cmd_list, index_count, instance_count, first_index,
-				vertex_offset, first_instance, hashes.pixel, false);
+		if (query_mesh_signature(context, arguments, mesh) && learned_mesh(mesh)) {
+			bool additive = false;
+			if (query_color_replay_state(context, mesh, additive)) {
+				// A resolution change can recreate the scene RT before the first subject
+				// draw. Learn that new resource at the point where the known mesh is seen.
+				remember_current_render_target(context);
+				return replay_color_draw(cmd_list, index_count, instance_count, first_index,
+					vertex_offset, first_instance, hashes.pixel, false);
+			}
 		}
 		mirror_scene_draw(cmd_list, index_count, instance_count, first_index,
 			vertex_offset, first_instance);
@@ -3040,10 +3413,19 @@ bool on_draw(command_list *cmd_list, uint32_t vertex_count, uint32_t instance_co
 	if (auto_shape)
 		record_nonindexed_candidate(hashes, vertex_count, instance_count, first_vertex,
 			first_instance, target_width, target_height);
+	if (g.shader_selector_active)
+		record_hunting_nonindexed_candidate(hashes, vertex_count, instance_count,
+			first_vertex, first_instance, rtv);
 	const bool auto_learned = auto_shape && has_learned_nonindexed_candidate(hashes,
 		vertex_count, instance_count, first_vertex, first_instance);
 	if (auto_learned)
 		remember_confirmed_scene_target(context);
+	if (ns_alpha_rules::preview_hides_nonindexed_draw(g.preview, hashes.pixel)) {
+		if (blend != nullptr) blend->Release();
+		if (rtv != nullptr) rtv->Release();
+		if (dsv != nullptr) dsv->Release();
+		return true;
+	}
 	if (!g.replay_capture_active) {
 		if (blend != nullptr) blend->Release();
 		if (rtv != nullptr) rtv->Release();
@@ -3098,6 +3480,10 @@ void reset_replay_frame_state() {
 	g.replay_draw_count = 0;
 	g.replay_nonindexed_draw_count = 0;
 	g.replay_clear_count = 0;
+	g.lens_diagnostic_logged = false;
+	g.lens_probe_draw_count = 0;
+	g.lens_color_probe_draw_count = 0;
+	g.lens_gradient_valid = false;
 }
 
 resource_view native_srv(ID3D11ShaderResourceView *view) {
@@ -3233,14 +3619,64 @@ void finish_hotkey_capture(uint32_t key, uint32_t modifiers) {
 	g.hotkey_capture_target = 0;
 }
 
+void clear_hotkey_pending() {
+	g.hotkey_pending_key = 0;
+	g.hotkey_pending_modifiers = ns_white_backing::modifier_none;
+}
+
+void stage_hotkey_capture(uint32_t key, uint32_t modifiers) {
+	g.hotkey_pending_key = key;
+	g.hotkey_pending_modifiers = ns_white_backing::sanitize_modifiers(modifiers);
+}
+
+void begin_hotkey_capture(int target) {
+	g.hotkey_capture_target = target;
+	g.hotkey_modifier_latch = ns_white_backing::modifier_none;
+	clear_hotkey_pending();
+}
+
+void cancel_hotkey_capture() {
+	g.hotkey_capture_target = 0;
+	g.hotkey_modifier_latch = ns_white_backing::modifier_none;
+	clear_hotkey_pending();
+}
+
+void draw_hotkey_capture_status() {
+	if (g.hotkey_capture_target == 0)
+		return;
+	ImGui::Separator();
+	if (g.hotkey_pending_key != 0) {
+		ImGui::TextWrapped("%s", text("Detected shortcut: ", "检测到快捷键："));
+		ImGui::SameLine();
+		ImGui::TextUnformatted(format_hotkey(g.hotkey_pending_key,
+			g.hotkey_pending_modifiers).c_str());
+		if (ImGui::Button(text("Confirm and save", "确认并保存"))) {
+			const uint32_t key = g.hotkey_pending_key;
+			const uint32_t modifiers = g.hotkey_pending_modifiers;
+			clear_hotkey_pending();
+			finish_hotkey_capture(key, modifiers);
+		}
+		ImGui::SameLine();
+		if (ImGui::Button(text("Cancel", "取消")))
+			cancel_hotkey_capture();
+		ImGui::SameLine();
+		ImGui::TextDisabled("%s", text("Esc clears the shortcut", "按 Esc 清空快捷键"));
+	} else {
+		ImGui::TextWrapped("%s", text(
+			"Press a shortcut. Esc clears the current shortcut; Backspace/Delete do the same.",
+			"请按下快捷键。按 Esc 清空当前快捷键，Backspace/Delete 也可以清空。"));
+	}
+}
+
 void process_hotkey_capture(effect_runtime *runtime) {
 	if (g.hotkey_capture_target == 0 || runtime == nullptr)
 		return;
 	ImGui::SetNextFrameWantCaptureKeyboard(true);
 	g.hotkey_modifier_latch |= current_imgui_modifiers() | current_runtime_modifiers(runtime);
 	if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-		g.hotkey_capture_target = 0;
+		finish_hotkey_capture(0, ns_white_backing::modifier_none);
 		g.hotkey_modifier_latch = ns_white_backing::modifier_none;
+		clear_hotkey_pending();
 		g.hotkey_suppress_key = VK_ESCAPE;
 		return;
 	}
@@ -3248,6 +3684,7 @@ void process_hotkey_capture(effect_runtime *runtime) {
 		ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
 		finish_hotkey_capture(0, ns_white_backing::modifier_none);
 		g.hotkey_modifier_latch = ns_white_backing::modifier_none;
+		clear_hotkey_pending();
 		g.hotkey_suppress_key = VK_BACK;
 		return;
 	}
@@ -3258,7 +3695,7 @@ void process_hotkey_capture(effect_runtime *runtime) {
 			virtual_key == VK_BACK || virtual_key == VK_DELETE ||
 			!ImGui::IsKeyPressed(imgui_key, false))
 			continue;
-		finish_hotkey_capture(virtual_key,
+		stage_hotkey_capture(virtual_key,
 			g.hotkey_modifier_latch | current_imgui_modifiers() | current_runtime_modifiers(runtime));
 		g.hotkey_modifier_latch = ns_white_backing::modifier_none;
 		g.hotkey_suppress_key = virtual_key;
@@ -3348,8 +3785,7 @@ void draw_group_editor_inline(size_t index) {
 		(key == 0 ? std::string(text("Press a key", "请按下一个键")) :
 			format_hotkey(key, modifiers))) + "##group_editor_key";
 	if (ImGui::Button(key_label.c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 0.0f))) {
-		g.hotkey_capture_target = 100 + static_cast<int>(index);
-		g.hotkey_modifier_latch = ns_white_backing::modifier_none;
+		begin_hotkey_capture(100 + static_cast<int>(index));
 	}
 
 	ImGui::Checkbox(text("Active at startup", "启动时启用"),
@@ -3562,6 +3998,21 @@ void stop_preview() {
 	ns_alpha_rules::preview_exit(g.preview);
 }
 
+bool preview_isolation_selected(uint32_t pixel) {
+	return g.preview.active && g.preview.kind == 1 &&
+		ns_alpha_rules::preview_has_isolation_pixel(g.preview, pixel);
+}
+
+void notify_isolation_toggle() {
+	if (!g.preview.active) {
+		show_notification(true, text("Isolation cleared", "已取消全部临时隔离"));
+		return;
+	}
+	const size_t count = g.preview.isolation_pixels.size();
+	show_notification(true, std::string(text("Isolation preview updated (", "临时隔离已更新（")) +
+		std::to_string(count) + text(" selected)", " 个着色器）"));
+}
+
 void draw_hunting_window() {
 	if (!g.hunting_open) {
 		if (g.preview.active)
@@ -3609,8 +4060,10 @@ void draw_hunting_window() {
 	}
 	if (ImGui::Button(text("Scan next frame", "扫描下一帧"))) {
 		g.shader_candidates.clear();
+		g.hunting_nonindexed_candidates.clear();
 		g.hunting_cursor = 0;
 		g.shader_selector_active = true;
+		g.shader_selector_skip_present = true;
 		show_notification(true, text("Shader hunting armed", "已准备扫描着色器"));
 	}
 	if (g.shader_selector_active) {
@@ -3681,15 +4134,16 @@ void draw_hunting_window() {
 			}
 			if (pixel_stage) {
 				ImGui::SameLine();
-				if (g.preview.active && g.preview.kind == 1 &&
-					g.preview.isolation_pixel == current) {
-					if (ImGui::Button(text("Stop isolation", "停止隔离预览")))
-						stop_preview();
-				} else if (ImGui::Button(text("Isolate preview", "隔离预览"))) {
-					if (!ns_alpha_rules::preview_enter_isolation(g.preview, current,
-						g.replay_capture_active))
+				const bool selected = preview_isolation_selected(current);
+				if (ImGui::Button(selected ? text("Cancel isolation", "取消隔离") :
+					text("Isolate preview", "隔离预览"))) {
+					const bool toggled = ns_alpha_rules::preview_toggle_isolation(g.preview, current,
+						g.replay_capture_active);
+					if (!toggled)
 						show_notification(false, text(
 							"Preview unavailable during capture", "捕获期间不能预览"));
+					else
+						notify_isolation_toggle();
 				}
 			}
 			ImGui::EndTabItem();
@@ -3761,6 +4215,10 @@ void draw_hunting_window() {
 					if (save_rule_groups())
 						show_notification(true, text(
 							"Candidate rule added (disabled)", "已加入候选规则（未启用）"));
+				} else {
+					show_notification(false, text(
+						"Select a target group before adding a candidate",
+						"请先选择目标分组，再加入候选规则"));
 				}
 			}
 			ImGui::TableSetColumnIndex(5);
@@ -3773,6 +4231,48 @@ void draw_hunting_window() {
 			ImGui::PopID();
 		}
 		ImGui::EndTable();
+	}
+
+	if (!g.hunting_nonindexed_candidates.empty()) {
+		ImGui::Separator();
+		ImGui::TextUnformatted(text("Observed non-indexed draws", "非索引 draw 候选"));
+		if (ImGui::BeginTable("##hunting_nonindexed_draws", 5,
+			ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg |
+			ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_NoSavedSettings)) {
+			ImGui::TableSetupColumn("PS", ImGuiTableColumnFlags_WidthFixed, 92.0f);
+			ImGui::TableSetupColumn("VS", ImGuiTableColumnFlags_WidthFixed, 92.0f);
+			ImGui::TableSetupColumn(text("Geometry", "几何"), ImGuiTableColumnFlags_WidthFixed, 150.0f);
+			ImGui::TableSetupColumn(text("Draws", "次数"), ImGuiTableColumnFlags_WidthFixed, 48.0f);
+			ImGui::TableSetupColumn("##isolate_nonindexed", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+			for (size_t index = 0; index < g.hunting_nonindexed_candidates.size(); ++index) {
+				const nonindexed_candidate &candidate = g.hunting_nonindexed_candidates[index];
+				ImGui::PushID(static_cast<int>(index));
+				ImGui::TableNextRow();
+				ImGui::TableSetColumnIndex(0);
+				ImGui::TextUnformatted(format_hash_hex(candidate.pixel).c_str());
+				ImGui::TableSetColumnIndex(1);
+				ImGui::TextUnformatted(format_hash_hex(candidate.vertex).c_str());
+				ImGui::TableSetColumnIndex(2);
+				ImGui::Text("%u:%u  %ux%u", candidate.vertex_count,
+					candidate.instance_count, candidate.width, candidate.height);
+				ImGui::TableSetColumnIndex(3);
+				ImGui::Text("%u", candidate.draw_count);
+				ImGui::TableSetColumnIndex(4);
+				const bool selected = preview_isolation_selected(candidate.pixel);
+				if (ImGui::SmallButton(selected ? text("Cancel isolation", "取消隔离") :
+					text("Isolate preview", "临时隔离"))) {
+					const bool toggled = ns_alpha_rules::preview_toggle_isolation(g.preview, candidate.pixel,
+						g.replay_capture_active);
+					if (!toggled)
+						show_notification(false, text(
+							"Preview unavailable during capture", "捕获期间不能隔离"));
+					else
+						notify_isolation_toggle();
+				}
+				ImGui::PopID();
+			}
+			ImGui::EndTable();
+		}
 	}
 	ImGui::End();
 }
@@ -3865,11 +4365,10 @@ void on_settings_overlay(effect_runtime *runtime) {
 			std::string(text("Press a new shortcut...", "请按下新的快捷键…")) : format_hotkey(key, modifiers)) +
 			"##shortcut_" + std::to_string(target);
 		if (ImGui::Button(button_label.c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 0.0f))) {
-			g.hotkey_capture_target = target;
-			g.hotkey_modifier_latch = ns_white_backing::modifier_none;
+			begin_hotkey_capture(target);
 		}
 	};
-	// Match REST's compact control spacing while adding enough vertical cell padding
+
 	// for ReShade font scaling to keep adjacent rows from overlapping.
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3.0f, 3.0f));
 	ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(3.0f, 5.0f));
@@ -3880,6 +4379,9 @@ void on_settings_overlay(effect_runtime *runtime) {
 		ImGui::TableSetupColumn("##setting_control", ImGuiTableColumnFlags_WidthStretch);
 		draw_hotkey_row(text("Screenshot shortcut", "截图快捷键"), 1, g.cfg.capture_key, g.cfg.capture_modifiers);
 		draw_hotkey_row(text("Reload shortcut", "重载快捷键"), 2, g.cfg.reload_key, g.cfg.reload_modifiers);
+		ImGui::TableNextRow();
+		ImGui::TableSetColumnIndex(1);
+		ImGui::TextDisabled("%s", text("Press ESC to clear", "按 ESC 清空"));
 		ImGui::TableNextRow();
 		ImGui::TableSetColumnIndex(0);
 		ImGui::TextUnformatted(text("Screenshot path", "截图路径"));
@@ -3912,6 +4414,7 @@ void on_settings_overlay(effect_runtime *runtime) {
 		ImGui::EndTable();
 	}
 	ImGui::PopStyleVar(2);
+	draw_hotkey_capture_status();
 	draw_group_list_settings();
 	draw_rule_editor_window();
 	draw_hunting_window();
@@ -3961,6 +4464,8 @@ void on_settings_overlay(effect_runtime *runtime) {
 
 void on_destroy_device(device *) {
 	g.replay_capture_active = false;
+	g.shader_selector_active = false;
+	g.shader_selector_skip_present = false;
 	reset_replay_frame_state();
 	g.learned_scene_targets.clear();
 	g.confirmed_scene_targets.clear();
@@ -3988,10 +4493,16 @@ void on_reshade_present(effect_runtime *runtime) {
 		reset_replay_frame_state();
 	}
 	if (g.shader_selector_active) {
-		g.shader_selector_active = false;
-		log_line("shader selector scan complete candidates=%zu", g.shader_candidates.size());
-		show_notification(true, std::string(text("Shader scan complete - choose a candidate in the addon settings",
-			"着色器扫描完成 - 请在 addon 设置中选择候选项")));
+		if (g.shader_selector_skip_present)
+			g.shader_selector_skip_present = false;
+		else if (!g.shader_candidates.empty() ||
+			!g.hunting_nonindexed_candidates.empty()) {
+			g.shader_selector_active = false;
+			log_line("shader selector scan complete indexed=%zu nonindexed=%zu",
+				g.shader_candidates.size(), g.hunting_nonindexed_candidates.size());
+			show_notification(true, std::string(text("Shader scan complete - choose a candidate in the addon settings",
+				"着色器扫描完成 - 请在 addon 设置中选择候选项")));
+		}
 	}
 	if (g.hotkey_capture_target != 0)
 		return;

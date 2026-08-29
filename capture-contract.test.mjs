@@ -49,7 +49,7 @@ test('output selection defaults to transparent only and controls only disk expor
   assert.match(replayExport, /g\.cfg\.output_black/)
   assert.match(replayExport, /g\.cfg\.output_white/)
   assert.match(replayExport, /g\.cfg\.output_transparent/)
-  assert.doesNotMatch(replayExport, /_rgba\.png|_alpha\.png|_rgba32f\.bin|_lens_/)
+  assert.doesNotMatch(replayExport, /_rgba\.png|_alpha\.png|_rgba32f\.bin|L"_lens_[^"]*\.png/)
 })
 
 test('capture filenames use a configurable ReShade-style token template', () => {
@@ -203,18 +203,51 @@ test('hunting offers deterministic navigation and transient preview only', () =>
   assert.match(source, /text\("Mark", "标记"\)/)
   assert.match(source, /text\("Add candidate", "加入候选"\)/)
   assert.match(source, /rule\.enabled = false/)
-  assert.match(source, /preview_enter_isolation\(g\.preview, current,\s*g\.replay_capture_active\)/)
+  assert.match(source, /preview_toggle_isolation\(g\.preview, current,\s*g\.replay_capture_active\)/)
   assert.match(rules, /preview_exit/)
   assert.match(rules, /preview = preview_state\{\}/)
   assert.match(rules, /if \(capture_active \|\| pixel == 0\)\s*return false/)
 })
 
-test('preview never interferes with the capture chain', () => {
+test('shader hunting collects a complete frame after the overlay arms scanning', () => {
   const source = read('./NS_AlphaCapture.cpp')
-  const callback = source.match(/bool on_draw_indexed\([^]*?\n\}/)?.[0] ?? ''
+  const presentCallback = source.match(/void on_reshade_present\([^]*?\n\}/)?.[0] ?? ''
+  const nonindexedCallback = source.match(/bool on_draw\([^]*?\n\}/)?.[0] ?? ''
+  const indexedRecorder = source.match(/void record_shader_candidate\([^]*?\n\}/)?.[0] ?? ''
 
-  assert.match(callback, /!g\.replay_capture_active && g\.preview\.active/)
-  assert.match(callback, /preview_hides_draw\(/)
+  assert.match(source, /bool shader_selector_skip_present = false/)
+  assert.match(source, /g\.shader_selector_active = true;\s*g\.shader_selector_skip_present = true;/)
+  assert.match(presentCallback,
+    /if \(g\.shader_selector_skip_present\)\s*g\.shader_selector_skip_present = false;\s*else if \(!g\.shader_candidates\.empty\(\) \|\|\s*!g\.hunting_nonindexed_candidates\.empty\(\)\) \{/)
+  assert.match(presentCallback,
+    /else if \(!g\.shader_candidates\.empty\(\) \|\|[^]*?g\.shader_selector_active = false;[^]*?scan complete/)
+  assert.doesNotMatch(indexedRecorder, /if \(render_target == 0\)\s*return;/)
+  assert.match(indexedRecorder, /if \(hashes\.pixel == 0 && hashes\.vertex == 0\)\s*return;/)
+  assert.match(nonindexedCallback,
+    /if \(g\.shader_selector_active\)\s*record_hunting_nonindexed_candidate\(/)
+})
+
+test('transient isolation combines selected indexed and non-indexed shaders during capture', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const rules = read('./shader_rules.hpp')
+  const indexedCallback = source.match(/bool on_draw_indexed\([^]*?\n\}/)?.[0] ?? ''
+  const nonindexedCallback = source.match(/bool on_draw\([^]*?\n\}/)?.[0] ?? ''
+
+  assert.match(rules, /std::vector<uint32_t> isolation_pixels/)
+  assert.match(rules, /preview_toggle_isolation/)
+  assert.match(rules, /std::find\(preview\.isolation_pixels\.begin\(\), preview\.isolation_pixels\.end\(\), pixel\)/)
+  assert.match(rules, /preview\.isolation_pixels\.empty\(\)/)
+  assert.match(indexedCallback, /g\.preview\.active &&\s*ns_alpha_rules::preview_hides_draw\(/)
+  assert.doesNotMatch(indexedCallback, /!g\.replay_capture_active && g\.preview\.active/)
+  assert.ok(indexedCallback.indexOf('preview_hides_draw(') <
+    indexedCallback.indexOf('if (g.replay_capture_active && g.cfg.lens_capture)'))
+  assert.match(nonindexedCallback, /preview_hides_nonindexed_draw\(g\.preview, hashes\.pixel\)/)
+  assert.doesNotMatch(nonindexedCallback,
+    /!g\.replay_capture_active &&\s*ns_alpha_rules::preview_hides_nonindexed_draw/)
+  assert.ok(nonindexedCallback.indexOf('preview_hides_nonindexed_draw(') <
+    nonindexedCallback.indexOf('if (!g.replay_capture_active)'))
+  assert.match(source, /preview_toggle_isolation\(g\.preview, current,\s*g\.replay_capture_active\)/)
+  assert.match(source, /preview_toggle_isolation\(g\.preview, candidate\.pixel,\s*g\.replay_capture_active\)/)
 })
 
 test('shader groups use Shader Toggler key packing and full-width shortcut bars', () => {
@@ -264,6 +297,61 @@ test('lens-only replay substitutes scene-color SRVs with separate black and whit
   assert.match(replay, /restore_lens_scene_srvs/)
 })
 
+test('lens scene-color substitution accepts half-resolution and sRGB inputs', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const lens = source.match(/bool lens_scene_srv_matches\([^]*?\n\}/)?.[0] ?? ''
+  const replay = source.match(/bool replay_color_draw\([^]*?\n\}/)?.[0] ?? ''
+
+  assert.match(source, /DXGI_FORMAT_R8G8B8A8_UNORM_SRGB/)
+  assert.match(source, /DXGI_FORMAT_B8G8R8A8_UNORM_SRGB/)
+  assert.match(lens, /allow_half_resolution/)
+  assert.match(lens, /description\.Width \* 2 == width/)
+  assert.match(lens, /description\.Height \* 2 == height/)
+  assert.match(replay, /bind_lens_scene_srvs\(context, g\.replay\.scene_black_srv\.Get\(\), lens_scene_srvs,[^;]*true, true\)/s)
+  assert.match(replay, /bind_lens_scene_srvs\(context, g\.replay\.scene_white_srv\.Get\(\), lens_scene_srvs,[^;]*false, true\)/s)
+})
+
+test('lens replay substitutes only the confirmed scene-color SRV slot', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const bind = source.match(/void bind_lens_scene_srvs\([^]*?\n\}/)?.[0] ?? ''
+  const query = source.match(/UINT query_lens_scene_srv_count\([^]*?\n\}/)?.[0] ?? ''
+
+  assert.match(source, /constexpr UINT lens_scene_color_slot = 2/)
+  assert.match(bind, /slot = lens_scene_color_slot/)
+  assert.doesNotMatch(bind, /slot = 0; slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT/)
+  assert.match(query, /views\[lens_scene_color_slot\]/)
+})
+
+test('lens replay extracts gradient color over neutral support and restores it after alpha reconstruction', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const replay = source.match(/bool replay_color_draw\([^]*?\n\}/)?.[0] ?? ''
+  const exportPath = source.match(/bool capture_replay_outputs\([^]*?\n\}/)?.[0] ?? ''
+  const override = source.match(/void apply_lens_gradient_override\([^]*?\n\}/)?.[0] ?? ''
+
+  assert.match(source, /lens_gradient_texture/)
+  assert.match(source, /lens_gradient_rtv/)
+  assert.match(replay, /gradient_rtv = g\.replay\.lens_gradient_rtv\.Get\(\)/)
+  assert.match(replay, /g\.replay\.scene_white_srv\.Get\(\)/)
+  assert.match(source, /apply_lens_gradient_override\(/)
+  assert.match(exportPath, /apply_lens_gradient_override\(rgba, gradient_raw, support_raw, underlay_ptr\)/)
+  assert.match(override, /scene saved immediately before the lens draw/)
+  assert.match(override, /gradient\.pixels\[index \+ channel\]/)
+  assert.match(override, /support\.pixels\[index \+ channel\].*\(1\.0f - lens_alpha\)/s)
+  assert.match(override, /base_premul/)
+  assert.match(source, /lens gradient underlay restored from pre-lens scene/)
+})
+
+test('lens gradient replay canvas is cleared once per frame, not once per draw', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const initialize = source.match(/void initialize_replay_targets\([^]*?\n\}/)?.[0] ?? ''
+  const replay = source.match(/bool replay_color_draw\([^]*?\n\}/)?.[0] ?? ''
+
+  assert.match(initialize, /ClearRenderTargetView\(g\.replay\.lens_gradient_rtv\.Get\(\)/)
+  assert.match(initialize, /ClearRenderTargetView\(g\.replay\.lens_support_rtv\.Get\(\)/)
+  assert.doesNotMatch(replay, /ClearRenderTargetView\(g\.replay\.lens_gradient_rtv\.Get\(/)
+  assert.doesNotMatch(replay, /ClearRenderTargetView\(g\.replay\.lens_support_rtv\.Get\(/)
+})
+
 test('ordinary capture isolates the confirmed lens draw without enabling lens-only mode', () => {
   const source = read('./NS_AlphaCapture.cpp')
   const callback = source.match(/bool on_draw_indexed\([^]*?\n\}/)?.[0] ?? ''
@@ -271,12 +359,66 @@ test('ordinary capture isolates the confirmed lens draw without enabling lens-on
 
   assert.match(callback, /g\.replay_capture_active && g\.cfg\.lens_capture/)
   assert.match(callback, /is_lens_target\([^]*?query_lens_replay_state/)
+  assert.match(callback, /is_runtime_lens_target\([^]*?query_lens_replay_state/)
+  assert.match(source, /UINT query_lens_scene_srv_count\(/)
   assert.match(callback, /replay_color_draw\([^]*?hashes\.pixel, true\)/)
   assert.match(replay, /if \(lens_only\)\s*\{[^}]*copy_scene_color_substitutes\(context\)/)
   assert.ok(
     replay.indexOf('copy_scene_color_substitutes(context)') <
       replay.indexOf('bind_lens_scene_srvs(context, g.replay.scene_black_srv.Get()'),
   )
+})
+
+test('configured gradient lens rules take precedence over runtime lens fallback', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const callback = source.match(/bool on_draw_indexed\([^]*?\n\}/)?.[0] ?? ''
+  const configuredIndex = callback.indexOf('const bool configured = is_configured_shader_rule')
+  const lensIndex = callback.indexOf('is_runtime_lens_target')
+
+  assert.ok(configuredIndex >= 0, 'configured rule check must remain in indexed capture')
+  assert.ok(lensIndex >= 0, 'runtime lens fallback must remain in indexed capture')
+  assert.ok(configuredIndex < lensIndex,
+    'configured gradient rules must be evaluated before runtime lens fallback')
+  assert.match(callback, /g\.cfg\.lens_capture && !configured/)
+})
+
+test('configured gradient lens rules use lens replay while ordinary configured rules stay normal', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const callback = source.match(/bool on_draw_indexed\([^]*?\n\}/)?.[0] ?? ''
+  const configuredLensStart = callback.indexOf('const bool configured_lens = configured &&')
+  const ordinaryConfiguredStart = callback.indexOf('bool configured_additive = false')
+  const configuredLensBlock = callback.slice(configuredLensStart, ordinaryConfiguredStart)
+
+  assert.match(callback, /const bool configured_lens = configured &&/)
+  assert.match(callback, /is_lens_target\(hashes, configured_mesh\)/)
+  assert.match(callback, /query_lens_replay_state\(context, configured_mesh\)/)
+  assert.match(configuredLensBlock, /replay_color_draw\([^;]*hashes\.pixel, true\)/s)
+  assert.match(callback, /if \(g\.replay_capture_active && g\.cfg\.lens_capture && !configured\)/)
+})
+
+test('lens capture records runtime branch diagnostics for the confirmed draw', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+
+  assert.match(source, /lens candidate observed ps=/)
+  assert.match(source, /lens replay state format=/)
+  assert.match(source, /lens_diagnostic_logged/)
+})
+
+test('lens diagnostics include a bounded indexed-draw probe for changed mesh signatures', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+
+  assert.match(source, /capture indexed probe ps=/)
+  assert.match(source, /lens_probe_draw_count < 128/)
+})
+
+test('lens diagnostics separately probe indexed draws that write color', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+
+  assert.match(source, /capture color probe ps=/)
+  assert.match(source, /lens_color_probe_draw_count < 64/)
+  assert.match(source, /RenderTargetWriteMask/)
+  assert.match(source, /query_probe_scene_srv_slots/)
+  assert.match(source, /srv=%s/)
 })
 
 test('addon exports its own synchronized RGBA reconstruction without requiring FX output', () => {
@@ -293,7 +435,7 @@ test('one capture keeps lens replay inside the selected core images without extr
   const presentCallback = source.match(/void on_reshade_present\([^]*?\n\}/)?.[0] ?? ''
 
   assert.match(replayExport, /const rgba_image &final_rgba = rgba/)
-  assert.doesNotMatch(replayExport, /capture_lens_effect_outputs|_lens_/)
+  assert.doesNotMatch(replayExport, /capture_lens_effect_outputs|L"_lens_[^"]*\.png/)
   assert.match(presentCallback, /capture_replay_outputs\(runtime\)/)
   assert.doesNotMatch(source, /set_technique_state/)
 })
@@ -376,6 +518,46 @@ test('shortcut capture keeps modifiers across frames and runtime matching uses R
   assert.match(source, /current_runtime_modifiers\(runtime\) == modifiers/)
   assert.match(source, /g\.hotkey_modifier_latch \|=/)
   assert.match(source, /process_hotkey_capture\(runtime\)/)
+})
+
+test('Escape clears the shortcut while recording instead of only cancelling capture', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const capture = source.match(/void process_hotkey_capture\(effect_runtime \*runtime\)\s*\{[^]*?\n\}/)?.[0] ?? ''
+
+  assert.match(capture, /ImGui::IsKeyPressed\(ImGuiKey_Escape, false\)/)
+  assert.match(capture, /finish_hotkey_capture\(0, ns_white_backing::modifier_none\)/)
+  assert.match(capture, /g\.hotkey_suppress_key = VK_ESCAPE/)
+  assert.doesNotMatch(capture, /if \(ImGui::IsKeyPressed\(ImGuiKey_Escape, false\)\) \{\s*g\.hotkey_capture_target = 0;/)
+})
+
+test('shortcut recording stages a key and requires explicit confirmation or cancellation', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const capture = source.match(/void process_hotkey_capture\(effect_runtime \*runtime\)\s*\{[^]*?\n\}/)?.[0] ?? ''
+  const status = source.match(/void draw_hotkey_capture_status\(\)\s*\{[^]*?\n\}/)?.[0] ?? ''
+
+  assert.match(source, /uint32_t hotkey_pending_key = 0/)
+  assert.match(capture, /stage_hotkey_capture\(virtual_key,/)
+  assert.doesNotMatch(capture, /finish_hotkey_capture\(virtual_key,/)
+  assert.match(status, /Detected shortcut/)
+  assert.match(status, /Confirm and save/)
+  assert.match(status, /Cancel/)
+  assert.match(status, /finish_hotkey_capture\(key, modifiers\)/)
+  assert.match(status, /cancel_hotkey_capture\(\)/)
+  assert.match(source, /Esc clears the shortcut/)
+})
+
+test('shortcut settings always show that Escape clears the selected shortcut', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const settings = source.slice(
+    source.indexOf('void on_settings_overlay'),
+    source.indexOf('draw_group_list_settings();', source.indexOf('void on_settings_overlay')),
+  )
+  const hint = 'text("Press ESC to clear", "按 ESC 清空")'
+  const pathControl = 'ImGui::TextUnformatted(text("Screenshot path", "截图路径"))'
+
+  assert.match(settings, /text\("Press ESC to clear", "按 ESC 清空"\)/)
+  assert.ok(settings.indexOf(hint) > settings.indexOf('Reload shortcut'))
+  assert.ok(settings.indexOf(hint) < settings.indexOf(pathControl))
 })
 
 test('Win is disabled as a shortcut modifier while legacy INI values remain readable', () => {
@@ -693,17 +875,35 @@ test('confirmed final highlight refreshes the scene target without a resolution 
   assert.match(learned, /g\.confirmed_scene_targets/)
 })
 
-test('later composites reuse the captured scene across render-target size changes', () => {
+test('later composites reuse the captured scene on the same render-target resource', () => {
   const source = read('./NS_AlphaCapture.cpp')
   const replay = source.match(/bool replay_nonindexed_composite_draw\([^]*?\n\}/)?.[0] ?? ''
 
   assert.match(replay, /const bool reuse_captured_scene = g\.replay_frame_started/)
-  assert.match(replay, /g\.replay\.width != target_desc\.Width/)
-  assert.match(replay, /g\.replay\.height != target_desc\.Height/)
-  assert.match(replay, /reusing captured scene=%ux%u without reset/)
+  assert.match(replay, /original_resource_id = render_target_resource_id/)
+  assert.match(replay, /replay_frame_target_resource == original_resource_id/)
   assert.match(replay, /\(!reuse_captured_scene &&\s*!ensure_replay_resources\(/)
   assert.match(replay, /if \(!reuse_captured_scene\)\s*initialize_replay_targets\(/)
   assert.match(replay, /context->DrawInstanced\(vertex_count, instance_count, first_vertex, first_instance\)/)
+})
+
+test('non-indexed composites restart replay when the bound scene resource is recreated', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const replay = source.match(/bool replay_nonindexed_composite_draw\([^]*?\n\}/)?.[0] ?? ''
+
+  assert.match(replay, /const uint64_t original_resource_id = render_target_resource_id\(original_rtvs\[0\]\)/)
+  assert.match(replay, /const bool reuse_captured_scene = g\.replay_frame_started &&\s*\n\s*g\.replay_frame_target_resource == original_resource_id/)
+  assert.match(replay, /replay_frame_target_resource/)
+  assert.match(replay, /resolution\/render-target change detected.*resetting replay scene/s)
+  assert.match(replay, /initialize_replay_targets\(context, original_resource_id\)/)
+})
+
+test('auto-match learns a recreated scene target when a known subject mesh returns', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const callback = source.match(/bool on_draw_indexed\([^]*?\n\}/)?.[0] ?? ''
+
+  assert.match(callback, /query_mesh_signature\(context, arguments, mesh\) && learned_mesh\(mesh\)/)
+  assert.match(callback, /if \(query_color_replay_state\(context, mesh, additive\)\) \{[^]*remember_current_render_target\(context\);[^]*replay_color_draw/s)
 })
 
 test('ordinary and additive replay blends preserve continuous alpha semantics', () => {
@@ -746,7 +946,7 @@ test('capture frame replaces the original transparent draw with the corrected co
   assert.match(replay, /OMSetRenderTargetsAndUnorderedAccessViews\(restore_count,[^]*?original_rtvs\.data\(\), original_dsv/)
   assert.match(replay, /OMSetBlendState\(replay_blend/)
   assert.match(replay, /OMSetDepthStencilState\(replay_depth_state/)
-  assert.equal((replay.match(/DrawIndexedInstanced\(/g) ?? []).length, 3)
+  assert.equal((replay.match(/DrawIndexedInstanced\(/g) ?? []).length, 4)
   assert.match(replay, /return true/)
   assert.match(callback, /return replay_color_draw\(/)
 })
@@ -761,7 +961,7 @@ test('RGBA32F readback stays internal and only selected PNG images are exported'
   assert.match(source, /mapped\.RowPitch/)
   assert.match(source, /reconstruct_black_white_rgba/)
   assert.match(source, /white\.pixels\[index \+ 0\] - black\.pixels\[index \+ 0\]/)
-  assert.doesNotMatch(replayExport, /_black_rgba32f\.bin|_white_rgba32f\.bin|_rgba\.png|_alpha\.png|_lens_/)
+  assert.doesNotMatch(replayExport, /_black_rgba32f\.bin|_white_rgba32f\.bin|_rgba\.png|_alpha\.png|L"_lens_[^"]*\.png/)
 })
 
 test('PNG export uses WIC BGRA without replacing the captured alpha byte', () => {
@@ -792,4 +992,16 @@ test('build emits the installed addon64 filename', () => {
 
   assert.match(build, /\/OUT:NS_AlphaCapture\.addon64(?:\s|$)/)
   assert.doesNotMatch(build, /NS_AlphaCapture\.addon64\.dll/)
+})
+
+test('release packaging always includes project and third-party licenses', () => {
+  const publish = read('./scripts/publish-release.ps1')
+
+  assert.match(publish, /LICENSE\.txt/)
+  assert.match(publish, /THIRD_PARTY_NOTICES\.txt/)
+  assert.match(publish, /Relative = 'LICENSE\.txt'/)
+  assert.match(publish, /Relative = 'THIRD_PARTY_NOTICES\.txt'/)
+  assert.match(publish, /Name = 'LICENSE\.txt'/)
+  assert.match(publish, /Name = 'THIRD_PARTY_NOTICES\.txt'/)
+  assert.match(publish, /'LICENSE\.txt',\s*'THIRD_PARTY_NOTICES\.txt'/)
 })

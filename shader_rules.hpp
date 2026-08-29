@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
@@ -88,7 +89,9 @@ struct rule_group {
 struct preview_state {
 	bool active = false;
 	int kind = 0;
+	// Kept for compatibility with older callers; multi-select uses the vector.
 	uint32_t isolation_pixel = 0;
+	std::vector<uint32_t> isolation_pixels;
 	size_t group_index = 0;
 };
 
@@ -155,7 +158,41 @@ inline bool preview_enter_isolation(preview_state &preview, uint32_t pixel,
 	preview.active = true;
 	preview.kind = 1;
 	preview.isolation_pixel = pixel;
+	preview.isolation_pixels.clear();
+	preview.isolation_pixels.push_back(pixel);
 	preview.group_index = 0;
+	return true;
+}
+
+inline bool preview_has_isolation_pixel(const preview_state &preview,
+	uint32_t pixel) {
+	return std::find(preview.isolation_pixels.begin(),
+		preview.isolation_pixels.end(), pixel) != preview.isolation_pixels.end();
+}
+
+inline void preview_exit(preview_state &preview);
+
+inline bool preview_toggle_isolation(preview_state &preview, uint32_t pixel,
+	bool capture_active) {
+	if (capture_active || pixel == 0)
+		return false;
+	if (preview.kind != 1) {
+		preview.active = true;
+		preview.kind = 1;
+		preview.group_index = 0;
+		preview.isolation_pixels.clear();
+	}
+	const auto found = std::find(preview.isolation_pixels.begin(), preview.isolation_pixels.end(), pixel);
+	if (found == preview.isolation_pixels.end())
+		preview.isolation_pixels.push_back(pixel);
+	else
+		preview.isolation_pixels.erase(found);
+	preview.isolation_pixel = preview.isolation_pixels.size() == 1 ?
+		preview.isolation_pixels.front() : 0;
+	if (preview.isolation_pixels.empty())
+		preview_exit(preview);
+	else
+		preview.active = true;
 	return true;
 }
 
@@ -166,6 +203,7 @@ inline bool preview_enter_group(preview_state &preview, size_t group_index,
 	preview.active = true;
 	preview.kind = 2;
 	preview.isolation_pixel = 0;
+	preview.isolation_pixels.clear();
 	preview.group_index = group_index;
 	return true;
 }
@@ -180,7 +218,7 @@ inline bool preview_hides_draw(const preview_state &preview,
 	if (!preview.active)
 		return false;
 	if (preview.kind == 1)
-		return pixel == preview.isolation_pixel;
+		return preview_has_isolation_pixel(preview, pixel);
 	if (preview.kind == 2) {
 		if (preview.group_index >= groups.size())
 			return false;
@@ -195,6 +233,16 @@ inline bool preview_hides_draw(const preview_state &preview,
 		}
 	}
 	return false;
+}
+
+// Non-indexed draws do not have an indexed rule signature.  Transient shader
+// isolation still applies to them by pixel-shader hash; saved rule groups do
+// not, so selecting a group never accidentally hides unrelated full-screen
+// composites.
+inline bool preview_hides_nonindexed_draw(const preview_state &preview,
+	uint32_t pixel) {
+	return preview.active && preview.kind == 1 &&
+		preview_has_isolation_pixel(preview, pixel);
 }
 
 struct ini_section {

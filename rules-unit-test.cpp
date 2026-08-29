@@ -316,6 +316,16 @@ static void test_preview_is_transient_and_restores() {
 	CHECK(preview_enter_isolation(preview, 100u, false));
 	CHECK(preview_hides_draw(preview, {}, 100u, 1u, 0u, 0u, 0));
 	CHECK(!preview_hides_draw(preview, {}, 101u, 1u, 0u, 0u, 0));
+	CHECK(!preview_hides_nonindexed_draw(preview, 101u));
+	CHECK(preview_hides_nonindexed_draw(preview, 100u));
+	CHECK(preview_toggle_isolation(preview, 101u, false));
+	CHECK(preview_hides_draw(preview, {}, 100u, 1u, 0u, 0u, 0));
+	CHECK(preview_hides_draw(preview, {}, 101u, 1u, 0u, 0u, 0));
+	CHECK(preview_toggle_isolation(preview, 100u, false));
+	CHECK(!preview_hides_draw(preview, {}, 100u, 1u, 0u, 0u, 0));
+	CHECK(preview_hides_nonindexed_draw(preview, 101u));
+	CHECK(preview_toggle_isolation(preview, 101u, false));
+	CHECK(!preview.active);
 	preview_exit(preview);
 	CHECK(!preview.active);
 	CHECK(preview.kind == 0);
@@ -332,6 +342,7 @@ static void test_preview_is_transient_and_restores() {
 	CHECK(!preview_hides_draw(preview, groups, 100u, 201u, 0u, 10u, 0));
 	preview_exit(preview);
 	CHECK(!preview_hides_draw(preview, groups, 100u, 200u, 0u, 10u, 0));
+	CHECK(!preview_hides_nonindexed_draw(preview, 100u));
 }
 
 #if defined(_WIN32)
