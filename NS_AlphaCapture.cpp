@@ -59,6 +59,11 @@ struct config {
 	bool output_black = false;
 	bool output_white = false;
 	bool output_transparent = true;
+	// 捕获时同时保存游戏画面 _Game.png（与 _Final 同帧）。
+	bool save_game_image = true;
+	// 带效果透明底 _FinalEffects.png：用原透明底 alpha 作选区，RGB 取游戏画面
+	// （含全部后处理/真实受光），alpha 取双底重建。不动原透明底计算。
+	bool output_effect_transparent = false;
 	std::string file_naming = default_file_naming;
 	bool auto_match = true;
 	bool auto_highlight = true;
@@ -238,6 +243,10 @@ struct state {
 	std::vector<ComPtr<ID3D11Resource>> learned_scene_targets;
 	std::vector<ComPtr<ID3D11Resource>> confirmed_scene_targets;
 	bool locale_zh = false;
+	// 捕获帧的游戏画面（finish_effects 时机：ReShade 效果后、一切 overlay 前——
+	// 无 ReShade 灰横幅、无 NS 通知、无 Dalamud/MSI 等外部 overlay）。
+	rgba_image game_image;
+	bool game_image_valid = false;
 	int hotkey_capture_target = 0;
 	uint32_t hotkey_modifier_latch = ns_white_backing::modifier_none;
 	uint32_t hotkey_suppress_key = 0;
@@ -512,7 +521,8 @@ bool save_hotkey(const char *key_name_value, const char *modifiers_name,
 	return write_ok;
 }
 
-bool save_output_selection(bool output_black, bool output_white, bool output_transparent) {
+bool save_output_selection(bool output_black, bool output_white, bool output_transparent,
+	bool save_game_image, bool output_effect_transparent) {
 	if (!output_black && !output_white && !output_transparent)
 		return false;
 	FILE *file = nullptr;
@@ -527,7 +537,9 @@ bool save_output_selection(bool output_black, bool output_white, bool output_tra
 	if (!read_ok ||
 		!set_capture_ini_value(content, "OutputBlack", output_black ? "1" : "0") ||
 		!set_capture_ini_value(content, "OutputWhite", output_white ? "1" : "0") ||
-		!set_capture_ini_value(content, "OutputTransparent", output_transparent ? "1" : "0"))
+		!set_capture_ini_value(content, "OutputTransparent", output_transparent ? "1" : "0") ||
+		!set_capture_ini_value(content, "SaveGameImage", save_game_image ? "1" : "0") ||
+		!set_capture_ini_value(content, "OutputEffectTransparent", output_effect_transparent ? "1" : "0"))
 		return false;
 	if (_wfopen_s(&file, g.config_path.c_str(), L"wb") != 0 || file == nullptr)
 		return false;
@@ -995,6 +1007,8 @@ bool load_config() {
 	read_bool("OutputBlack", fresh.output_black);
 	read_bool("OutputWhite", fresh.output_white);
 	read_bool("OutputTransparent", fresh.output_transparent);
+	read_bool("SaveGameImage", fresh.save_game_image);
+	read_bool("OutputEffectTransparent", fresh.output_effect_transparent);
 	bool file_naming_from_addon = false;
 	if (const std::string *file_naming_value = find_config_value(entries, "FileNaming")) {
 		const std::string trimmed = trim_ascii(*file_naming_value);
@@ -2685,6 +2699,23 @@ bool capture_replay_outputs(effect_runtime *runtime) {
 		success = save_texture_png(white_path, white_rgba, error);
 	if (success && g.cfg.output_transparent)
 		success = save_texture_png(final_path, final_rgba, error);
+	// 游戏画面参考图 + 带效果透明底。游戏画面在 finish_effects 时捕获（效果后、任何
+	// overlay 前）。两者失败不影响主输出。
+	if (g.game_image_valid &&
+		g.game_image.width == rgba.width && g.game_image.height == rgba.height) {
+		if (g.cfg.save_game_image) {
+			std::string game_error;
+			save_texture_png(prefix + L"_Game.png", g.game_image, game_error);
+		}
+		if (g.cfg.output_effect_transparent) {
+			// 用原透明底 alpha 作选区：RGB 取游戏画面（真实受光/后处理），alpha 取双底重建。
+			rgba_image fx = g.game_image;
+			for (size_t index = 0; index < fx.pixels.size(); index += 4)
+				fx.pixels[index + 3] = rgba.pixels[index + 3];
+			std::string fx_error;
+			save_texture_png(prefix + L"_FinalEffects.png", fx, fx_error);
+		}
+	}
 	if (success) {
 		log_line("capture pixels: black_nonzero=%llu white_nonwhite=%llu alpha_nontrivial=%llu",
 			static_cast<unsigned long long>(black_nonzero_pixels),
@@ -3501,6 +3532,27 @@ void update_replay_texture_bindings(effect_runtime *runtime) {
 
 void on_reshade_begin_effects(effect_runtime *runtime, command_list *, resource_view, resource_view) {
 	update_replay_texture_bindings(runtime);
+}
+
+// finish_effects 时机：ReShade 效果已渲染完、但 ReShade overlay（顶部灰横幅）、NS 通知
+// 横幅、Dalamud/MSI 等外部 overlay 都还没画到 backbuffer。这是能拿到的最干净的"玩家
+// 实际看到的游戏画面"，与捕获帧同帧同瞬间。
+void on_reshade_finish_effects(effect_runtime *runtime, command_list *, resource_view, resource_view) {
+	g.game_image_valid = false;
+	if (runtime == nullptr || !g.replay_capture_active ||
+		(!g.cfg.save_game_image && !g.cfg.output_effect_transparent))
+		return;
+	uint32_t w = 0, h = 0;
+	runtime->get_screenshot_width_and_height(&w, &h);
+	if (w == 0 || h == 0)
+		return;
+	g.game_image.width = w;
+	g.game_image.height = h;
+	g.game_image.pixels.resize(static_cast<size_t>(w) * h * 4);
+	if (runtime->capture_screenshot(g.game_image.pixels.data()))
+		g.game_image_valid = true;
+	else
+		log_line("game screenshot capture failed");
 }
 
 void on_reshade_reloaded_effects(effect_runtime *runtime) {
@@ -4421,6 +4473,8 @@ void on_settings_overlay(effect_runtime *runtime) {
 	bool output_black = g.cfg.output_black;
 	bool output_white = g.cfg.output_white;
 	bool output_transparent = g.cfg.output_transparent;
+	bool save_game_image = g.cfg.save_game_image;
+	bool output_effect_transparent = g.cfg.output_effect_transparent;
 	bool output_changed = false;
 	const float output_label_width = ImGui::CalcTextSize(text("Output", "输出")).x;
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3.0f, 3.0f));
@@ -4439,6 +4493,10 @@ void on_settings_overlay(effect_runtime *runtime) {
 		output_changed |= ImGui::Checkbox(text("White background", "白底图"), &output_white);
 		ImGui::SameLine();
 		output_changed |= ImGui::Checkbox(text("Transparent", "透明图"), &output_transparent);
+		ImGui::SameLine();
+		output_changed |= ImGui::Checkbox(text("Game image", "游戏画面"), &save_game_image);
+		ImGui::SameLine();
+		output_changed |= ImGui::Checkbox(text("Effected transparent", "带效果透明底"), &output_effect_transparent);
 		ImGui::EndTable();
 	}
 	ImGui::PopStyleVar(2);
@@ -4446,13 +4504,16 @@ void on_settings_overlay(effect_runtime *runtime) {
 		if (!output_black && !output_white && !output_transparent) {
 			show_notification(false, capture_failure_message(
 				text("select at least one output", "请至少选择一种输出")));
-		} else if (!save_output_selection(output_black, output_white, output_transparent)) {
+		} else if (!save_output_selection(output_black, output_white, output_transparent,
+				save_game_image, output_effect_transparent)) {
 			show_notification(false, capture_failure_message(
 				text("could not save output selection", "无法保存输出选项")));
 		} else {
 			g.cfg.output_black = output_black;
 			g.cfg.output_white = output_white;
 			g.cfg.output_transparent = output_transparent;
+			g.cfg.save_game_image = save_game_image;
+			g.cfg.output_effect_transparent = output_effect_transparent;
 			show_notification(true, text("NS Alpha Capture - Output selection saved",
 				"NS Alpha Capture - 输出选项已保存"));
 		}
@@ -4584,6 +4645,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 		reshade::register_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
 		reshade::register_event<reshade::addon_event::clear_render_target_view>(on_clear_render_target_view);
 		reshade::register_event<reshade::addon_event::reshade_begin_effects>(on_reshade_begin_effects);
+	reshade::register_event<reshade::addon_event::reshade_finish_effects>(on_reshade_finish_effects);
 		reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(on_reshade_reloaded_effects);
 		reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
 		reshade::register_event<reshade::addon_event::reshade_overlay>(on_reshade_overlay);
@@ -4596,6 +4658,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 		reshade::unregister_event<reshade::addon_event::reshade_present>(on_reshade_present);
 		reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(on_reshade_reloaded_effects);
 		reshade::unregister_event<reshade::addon_event::reshade_begin_effects>(on_reshade_begin_effects);
+	reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(on_reshade_finish_effects);
 		reshade::unregister_event<reshade::addon_event::clear_render_target_view>(on_clear_render_target_view);
 		reshade::unregister_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
 		reshade::unregister_event<reshade::addon_event::draw>(on_draw);
