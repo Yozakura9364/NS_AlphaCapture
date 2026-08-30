@@ -1,8 +1,8 @@
 #include <windows.h>
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,3,2,0
- PRODUCTVERSION 0,3,2,0
+ FILEVERSION 0,3,7,0
+ PRODUCTVERSION 0,3,7,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS VS_FF_DEBUG
@@ -19,12 +19,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Nightingale Silence"
             VALUE "FileDescription", "Transparent RGBA capture addon for FINAL FANTASY XIV"
-            VALUE "FileVersion", "0.3.2.0"
+            VALUE "FileVersion", "0.3.7.0"
             VALUE "InternalName", "NS_AlphaCapture"
             VALUE "LegalCopyright", "Copyright (C) 2026 Nightingale Silence"
             VALUE "OriginalFilename", "NS_AlphaCapture.addon64"
             VALUE "ProductName", "NS Alpha Capture"
-            VALUE "ProductVersion", "0.3.2"
+            VALUE "ProductVersion", "0.3.7"
         END
     END
     BLOCK "VarFileInfo"
