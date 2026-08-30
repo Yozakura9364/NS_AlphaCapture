@@ -694,7 +694,7 @@ test('stable build identifies the author and contains no lighting experiment cha
   assert.match(build, /rc \/nologo \/fo NS_AlphaCapture\.res NS_AlphaCapture\.rc/)
   assert.match(build, /NS_AlphaCapture\.cpp NS_AlphaCapture\.res/)
   assert.doesNotMatch(source, /Author: Nightingale Silence|作者：Nightingale Silence/)
-  assert.match(readme, /作者：Nightingale Silence/)
+  assert.match(readme, /NS Alpha Capture/)
   for (const experiment of ['SceneColorReplay', 'LightDrawProbe', 'Rule7']) {
     assert.doesNotMatch(source, new RegExp(experiment))
     assert.doesNotMatch(config, new RegExp(experiment))
@@ -1005,7 +1005,7 @@ test('release packaging always includes project and third-party licenses', () =>
   assert.match(publish, /'LICENSE\.txt',\s*'THIRD_PARTY_NOTICES\.txt'/)
 })
 
-test('addon capture follows ReShade enabled_in_screenshot filtering', () => {
+test('addon capture disables enabled_in_screenshot=false techniques (e.g. VerticalPreviewer)', () => {
   const source = read('./NS_AlphaCapture.cpp')
 
   assert.match(source, /screenshot_hidden_techniques/)
@@ -1017,14 +1017,19 @@ test('addon capture follows ReShade enabled_in_screenshot filtering', () => {
   assert.match(source, /set_technique_state\(technique, true\)/)
 })
 
-test('screenshot filtering is scoped to the capture frame and restored on all finish paths', () => {
+test('screenshot-excluded techniques are toggled in present (non-render timing), never inside effects callbacks', () => {
   const source = read('./NS_AlphaCapture.cpp')
+  const begin = source.match(/void on_reshade_begin_effects\([^]*?\n\}/)?.[0] ?? ''
   const finish = source.match(/void on_reshade_finish_effects\([^]*?\n\}/)?.[0] ?? ''
 
-  assert.match(source, /if \(runtime == nullptr \|\| !g\.replay_capture_active\)/)
-  assert.match(source, /if \(!g\.cfg\.save_game_image && !g\.cfg\.output_effect_transparent\)/)
+  // 禁用发生在按下捕获键（present，非渲染时机）
+  assert.match(source, /capture_pressed\) \{[^]*?hide_screenshot_excluded_techniques\(runtime\)/s)
+  // 捕获完成后恢复
+  assert.match(source, /capture_replay_outputs\(runtime\);[^]*?restore_screenshot_hidden_techniques\(runtime\)/s)
+  // effects 渲染回调里绝不做 technique 切换（避免管线重入死锁）
+  assert.doesNotMatch(begin, /set_technique_state|enumerate_techniques/)
+  assert.doesNotMatch(finish, /set_technique_state|enumerate_techniques/)
   assert.match(finish, /capture_game_image\(runtime, "finish_effects"\)/)
-  assert.match(finish, /capture_game_image\([^]*restore_screenshot_hidden_techniques/s)
   assert.match(source, /g\.screenshot_hidden_techniques\.clear\(\);/)
 })
 

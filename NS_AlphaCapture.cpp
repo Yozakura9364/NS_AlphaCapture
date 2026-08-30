@@ -249,8 +249,9 @@ struct state {
 	// 无 ReShade 灰横幅、无 NS 通知、无 Dalamud/MSI 等外部 overlay）。
 	rgba_image game_image;
 	bool game_image_valid = false;
-	// Techniques with enabled_in_screenshot=false are temporarily disabled while
-	// rendering the addon capture frame, then restored after the backbuffer readback.
+	// enabled_in_screenshot=false 的 technique（预览/构图辅助类）在捕获帧
+	// 临时禁用、捕获后恢复。禁用在 present（非渲染时机）做——在 effects 渲染回调里
+	// set_technique_state 会触发管线重入死锁。
 	std::vector<effect_technique> screenshot_hidden_techniques;
 	int hotkey_capture_target = 0;
 	uint32_t hotkey_modifier_latch = ns_white_backing::modifier_none;
@@ -3544,15 +3545,20 @@ void update_replay_texture_bindings(effect_runtime *runtime) {
 
 void on_reshade_begin_effects(effect_runtime *runtime, command_list *, resource_view, resource_view) {
 	update_replay_texture_bindings(runtime);
-	if (runtime == nullptr || !g.replay_capture_active)
-		return;
+}
 
+// 禁用所有 enabled_in_screenshot=false 的 technique（预览/构图辅助类），
+// 避免污染 _Game.png。必须在非渲染时机（present 按键处理）调用——在 effects 渲染
+// 回调里 set_technique_state 会触发管线重入死锁。
+void hide_screenshot_excluded_techniques(effect_runtime *runtime) {
+	if (runtime == nullptr)
+		return;
 	g.screenshot_hidden_techniques.clear();
 	runtime->enumerate_techniques(nullptr,
 		[](effect_runtime *owner, effect_technique technique, void *user_data) {
 			auto *hidden = static_cast<std::vector<effect_technique> *>(user_data);
 			bool enabled_in_screenshot = true;
-			// Missing annotation defaults to enabled, matching ReShade runtime behavior.
+			// 缺 annotation 默认可见，与 ReShade 运行时行为一致。
 			if (!owner->get_annotation_bool_from_technique(technique,
 				"enabled_in_screenshot", &enabled_in_screenshot, 1) ||
 				enabled_in_screenshot || !owner->get_technique_state(technique))
@@ -3561,7 +3567,7 @@ void on_reshade_begin_effects(effect_runtime *runtime, command_list *, resource_
 			hidden->push_back(technique);
 		}, &g.screenshot_hidden_techniques);
 	if (!g.screenshot_hidden_techniques.empty())
-		log_line("capture screenshot filter disabled %zu technique(s)",
+		log_line("capture filter disabled %zu screenshot-excluded technique(s)",
 			g.screenshot_hidden_techniques.size());
 }
 
@@ -3602,22 +3608,15 @@ bool capture_game_image(effect_runtime *runtime, const char *stage) {
 // 实际看到的游戏画面"，与捕获帧同帧同瞬间。
 void on_reshade_finish_effects(effect_runtime *runtime, command_list *, resource_view, resource_view) {
 	g.game_image_valid = false;
-	if (runtime == nullptr || !g.replay_capture_active) {
-		restore_screenshot_hidden_techniques(runtime);
+	if (runtime == nullptr || !g.replay_capture_active)
 		return;
-	}
-	if (!g.cfg.save_game_image && !g.cfg.output_effect_transparent) {
-		restore_screenshot_hidden_techniques(runtime);
+	if (!g.cfg.save_game_image && !g.cfg.output_effect_transparent)
 		return;
-	}
-	if (!capture_game_image(runtime, "finish_effects")) {
-		restore_screenshot_hidden_techniques(runtime);
-		return;
-	}
-	restore_screenshot_hidden_techniques(runtime);
+	capture_game_image(runtime, "finish_effects");
 }
 
 void on_reshade_reloaded_effects(effect_runtime *runtime) {
+	// effects 重载后 technique handle 失效，禁用状态由 ReShade 重置，直接清空记录。
 	g.screenshot_hidden_techniques.clear();
 	update_replay_texture_bindings(runtime);
 }
@@ -4594,7 +4593,6 @@ void on_destroy_device(device *) {
 	g.learned_scene_targets.clear();
 	g.confirmed_scene_targets.clear();
 	g.replay = {};
-	g.screenshot_hidden_techniques.clear();
 }
 
 void on_reshade_present(effect_runtime *runtime) {
@@ -4621,6 +4619,8 @@ void on_reshade_present(effect_runtime *runtime) {
 		capture_replay_outputs(runtime);
 		g.replay_capture_active = false;
 		reset_replay_frame_state();
+		// 捕获完成，恢复预览 technique。
+		restore_screenshot_hidden_techniques(runtime);
 	}
 	if (g.shader_selector_active) {
 		if (g.shader_selector_skip_present)
@@ -4647,6 +4647,9 @@ void on_reshade_present(effect_runtime *runtime) {
 	if (capture_pressed) {
 		reset_replay_frame_state();
 		g.game_image_valid = false;
+		// 禁用 enabled_in_screenshot=false 的预览 technique，
+		// 避免污染 _Game.png。present 是非渲染时机，set_technique_state 不会重入。
+		hide_screenshot_excluded_techniques(runtime);
 		g.replay_capture_active = true;
 		log_line("capture armed: next frame capture active");
 		show_notification(true, text("NS Alpha Capture - Capturing next color frame", "NS Alpha Capture - 正在捕获下一帧画面"));
