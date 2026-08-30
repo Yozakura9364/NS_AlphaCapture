@@ -8,6 +8,20 @@
 *.log
 FABLE5_TRANSPARENCY_PROMPT.md
 
+# Internal agent/workflow notes and docs (not for public repo)
+AGENTS.md
+docs/
+
+# Dev/test scripts and personal deploy configs (contain local paths)
+deploy-0.3.2-after-exit.ps1
+deploy-composite-after-exit.ps1
+analyze-*.mjs
+generate-example.mjs
+inspect_capture.py
+verify-output.mjs
+NS_AlphaCapture.lens-test.ini
+NS_PipelineProbe_color-pass-capture.ini
+
 # Editor and OS metadata
 .vs/
 .vscode/
