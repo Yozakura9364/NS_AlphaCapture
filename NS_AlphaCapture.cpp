@@ -72,6 +72,8 @@ struct config {
 	uint32_t lens_pixel_shader_hash = 3361469263u;
 	uint32_t lens_first_index = 6448u;
 	uint32_t lens_index_count = 276u;
+	// Optional capture-only exclusion for a known scene-water pixel shader.
+	uint32_t capture_exclude_pixel_shader_hash = 0;
 };
 
 struct rgba_image {
@@ -247,6 +249,9 @@ struct state {
 	// 无 ReShade 灰横幅、无 NS 通知、无 Dalamud/MSI 等外部 overlay）。
 	rgba_image game_image;
 	bool game_image_valid = false;
+	// Techniques with enabled_in_screenshot=false are temporarily disabled while
+	// rendering the addon capture frame, then restored after the backbuffer readback.
+	std::vector<effect_technique> screenshot_hidden_techniques;
 	int hotkey_capture_target = 0;
 	uint32_t hotkey_modifier_latch = ns_white_backing::modifier_none;
 	uint32_t hotkey_suppress_key = 0;
@@ -1074,7 +1079,8 @@ bool load_config() {
 	};
 	if (!read_u32("LensPixelShaderHash", fresh.lens_pixel_shader_hash) ||
 		!read_u32("LensFirstIndex", fresh.lens_first_index) ||
-		!read_u32("LensIndexCount", fresh.lens_index_count)) {
+		!read_u32("LensIndexCount", fresh.lens_index_count) ||
+		!read_u32("CaptureExcludePixelShaderHash", fresh.capture_exclude_pixel_shader_hash)) {
 		g.cfg = fresh;
 		g.config_loaded = false;
 		g.config_error = "LensOnly configuration is invalid";
@@ -3302,6 +3308,12 @@ bool on_draw_indexed(command_list *cmd_list, uint32_t index_count, uint32_t inst
 	}
 	const bool configured = is_configured_shader_rule(hashes, index_count, first_index,
 		vertex_offset);
+	if (g.replay_capture_active && g.cfg.capture_exclude_pixel_shader_hash != 0 &&
+		hashes.pixel == g.cfg.capture_exclude_pixel_shader_hash) {
+		log_line("capture excluded pixel shader ps=%u vs=%u first=%u count=%u",
+			hashes.pixel, hashes.vertex, first_index, index_count);
+		return false;
+	}
 	if (configured) {
 		mesh_signature configured_mesh;
 		if (g.replay_capture_active && query_mesh_signature(context, arguments, configured_mesh)) {
@@ -3532,6 +3544,57 @@ void update_replay_texture_bindings(effect_runtime *runtime) {
 
 void on_reshade_begin_effects(effect_runtime *runtime, command_list *, resource_view, resource_view) {
 	update_replay_texture_bindings(runtime);
+	if (runtime == nullptr || !g.replay_capture_active)
+		return;
+
+	g.screenshot_hidden_techniques.clear();
+	runtime->enumerate_techniques(nullptr,
+		[](effect_runtime *owner, effect_technique technique, void *user_data) {
+			auto *hidden = static_cast<std::vector<effect_technique> *>(user_data);
+			bool enabled_in_screenshot = true;
+			// Missing annotation defaults to enabled, matching ReShade runtime behavior.
+			if (!owner->get_annotation_bool_from_technique(technique,
+				"enabled_in_screenshot", &enabled_in_screenshot, 1) ||
+				enabled_in_screenshot || !owner->get_technique_state(technique))
+				return;
+			owner->set_technique_state(technique, false);
+			hidden->push_back(technique);
+		}, &g.screenshot_hidden_techniques);
+	if (!g.screenshot_hidden_techniques.empty())
+		log_line("capture screenshot filter disabled %zu technique(s)",
+			g.screenshot_hidden_techniques.size());
+}
+
+void restore_screenshot_hidden_techniques(effect_runtime *runtime) {
+	if (runtime != nullptr) {
+		for (effect_technique technique : g.screenshot_hidden_techniques)
+			runtime->set_technique_state(technique, true);
+	}
+	g.screenshot_hidden_techniques.clear();
+}
+
+bool capture_game_image(effect_runtime *runtime, const char *stage) {
+	if (runtime == nullptr)
+		return false;
+	uint32_t w = 0, h = 0;
+	runtime->get_screenshot_width_and_height(&w, &h);
+	if (w == 0 || h == 0)
+		return false;
+	g.game_image.width = w;
+	g.game_image.height = h;
+	g.game_image.pixels.resize(static_cast<size_t>(w) * h * 4);
+	if (!runtime->capture_screenshot(g.game_image.pixels.data())) {
+		log_line("game screenshot capture failed stage=%s", stage);
+		return false;
+	}
+	// ReShade's regular screenshot is visually opaque. Game backbuffers used by
+	// FFXIV may carry alpha=0 even when RGB contains the rendered scene, which
+	// would make an otherwise valid PNG appear empty in image viewers.
+	for (size_t index = 3; index < g.game_image.pixels.size(); index += 4)
+		g.game_image.pixels[index] = 255;
+	g.game_image_valid = true;
+	log_line("game screenshot captured stage=%s size=%ux%u", stage, w, h);
+	return true;
 }
 
 // finish_effects 时机：ReShade 效果已渲染完、但 ReShade overlay（顶部灰横幅）、NS 通知
@@ -3539,23 +3602,23 @@ void on_reshade_begin_effects(effect_runtime *runtime, command_list *, resource_
 // 实际看到的游戏画面"，与捕获帧同帧同瞬间。
 void on_reshade_finish_effects(effect_runtime *runtime, command_list *, resource_view, resource_view) {
 	g.game_image_valid = false;
-	if (runtime == nullptr || !g.replay_capture_active ||
-		(!g.cfg.save_game_image && !g.cfg.output_effect_transparent))
+	if (runtime == nullptr || !g.replay_capture_active) {
+		restore_screenshot_hidden_techniques(runtime);
 		return;
-	uint32_t w = 0, h = 0;
-	runtime->get_screenshot_width_and_height(&w, &h);
-	if (w == 0 || h == 0)
+	}
+	if (!g.cfg.save_game_image && !g.cfg.output_effect_transparent) {
+		restore_screenshot_hidden_techniques(runtime);
 		return;
-	g.game_image.width = w;
-	g.game_image.height = h;
-	g.game_image.pixels.resize(static_cast<size_t>(w) * h * 4);
-	if (runtime->capture_screenshot(g.game_image.pixels.data()))
-		g.game_image_valid = true;
-	else
-		log_line("game screenshot capture failed");
+	}
+	if (!capture_game_image(runtime, "finish_effects")) {
+		restore_screenshot_hidden_techniques(runtime);
+		return;
+	}
+	restore_screenshot_hidden_techniques(runtime);
 }
 
 void on_reshade_reloaded_effects(effect_runtime *runtime) {
+	g.screenshot_hidden_techniques.clear();
 	update_replay_texture_bindings(runtime);
 }
 
@@ -4531,10 +4594,16 @@ void on_destroy_device(device *) {
 	g.learned_scene_targets.clear();
 	g.confirmed_scene_targets.clear();
 	g.replay = {};
+	g.screenshot_hidden_techniques.clear();
 }
 
 void on_reshade_present(effect_runtime *runtime) {
 	update_locale(runtime);
+	// If ReShade skips effect callbacks (for example when all effects are disabled),
+	// present is the last clean point before external overlay addons draw their UI.
+	// Capture here so Dalamud/Ktisis overlays do not enter the game reference image.
+	if (g.replay_capture_active && !g.game_image_valid)
+		capture_game_image(runtime, "present_fallback");
 	if (runtime != nullptr) {
 		for (ns_alpha_rules::rule_group &group : g.rule_groups) {
 			uint32_t toggle_key = 0;
@@ -4577,6 +4646,7 @@ void on_reshade_present(effect_runtime *runtime) {
 		g.cfg.capture_modifiers);
 	if (capture_pressed) {
 		reset_replay_frame_state();
+		g.game_image_valid = false;
 		g.replay_capture_active = true;
 		log_line("capture armed: next frame capture active");
 		show_notification(true, text("NS Alpha Capture - Capturing next color frame", "NS Alpha Capture - 正在捕获下一帧画面"));
@@ -4601,7 +4671,11 @@ void on_reshade_present(effect_runtime *runtime) {
 
 }
 
-void on_reshade_overlay(effect_runtime *) {
+void on_reshade_overlay(effect_runtime *runtime) {
+	// Keep a final fallback for runtimes that do not provide a usable present readback.
+	// Normally present_fallback already captured before external overlay addons run.
+	if (g.replay_capture_active && !g.game_image_valid)
+		capture_game_image(runtime, "overlay_fallback");
 	if (g.notification_message.empty() || GetTickCount64() >= g.notification_expires_at)
 		return;
 

@@ -437,7 +437,6 @@ test('one capture keeps lens replay inside the selected core images without extr
   assert.match(replayExport, /const rgba_image &final_rgba = rgba/)
   assert.doesNotMatch(replayExport, /capture_lens_effect_outputs|L"_lens_[^"]*\.png/)
   assert.match(presentCallback, /capture_replay_outputs\(runtime\)/)
-  assert.doesNotMatch(source, /set_technique_state/)
 })
 
 test('effect consumes addon-rendered black and white targets without synthesizing either background', () => {
@@ -1004,4 +1003,70 @@ test('release packaging always includes project and third-party licenses', () =>
   assert.match(publish, /Name = 'LICENSE\.txt'/)
   assert.match(publish, /Name = 'THIRD_PARTY_NOTICES\.txt'/)
   assert.match(publish, /'LICENSE\.txt',\s*'THIRD_PARTY_NOTICES\.txt'/)
+})
+
+test('addon capture follows ReShade enabled_in_screenshot filtering', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+
+  assert.match(source, /screenshot_hidden_techniques/)
+  assert.match(source, /enumerate_techniques\(nullptr/)
+  assert.match(source, /get_annotation_bool_from_technique\(technique,\s*"enabled_in_screenshot"/s)
+  assert.match(source, /enabled_in_screenshot \|\| !owner->get_technique_state/)
+  assert.match(source, /set_technique_state\(technique, false\)/)
+  assert.match(source, /restore_screenshot_hidden_techniques\(runtime\)/)
+  assert.match(source, /set_technique_state\(technique, true\)/)
+})
+
+test('screenshot filtering is scoped to the capture frame and restored on all finish paths', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const finish = source.match(/void on_reshade_finish_effects\([^]*?\n\}/)?.[0] ?? ''
+
+  assert.match(source, /if \(runtime == nullptr \|\| !g\.replay_capture_active\)/)
+  assert.match(source, /if \(!g\.cfg\.save_game_image && !g\.cfg\.output_effect_transparent\)/)
+  assert.match(finish, /capture_game_image\(runtime, "finish_effects"\)/)
+  assert.match(finish, /capture_game_image\([^]*restore_screenshot_hidden_techniques/s)
+  assert.match(source, /g\.screenshot_hidden_techniques\.clear\(\);/)
+})
+
+test('capture does not post-process the final image to erase shader artifacts', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+
+  assert.doesNotMatch(source, /detect_(?:grid|guide|line)|erase_(?:grid|guide|line)|remove_(?:grid|guide|line)/i)
+  assert.doesNotMatch(source, /VerticalPreviewer|Vertical_Previewer/)
+})
+
+test('game image capture falls back when ReShade skips effects callbacks', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const present = source.match(/void on_reshade_present\([^]*?\n\}/)?.[0] ?? ''
+  const overlay = source.match(/void on_reshade_overlay\([^]*?\n\}/)?.[0] ?? ''
+  const finish = source.match(/void on_reshade_finish_effects\([^]*?\n\}/)?.[0] ?? ''
+
+  assert.match(source, /bool capture_game_image\(effect_runtime \*runtime, const char \*stage\)/)
+  assert.match(finish, /capture_game_image\(runtime, "finish_effects"\)/)
+  assert.match(overlay, /if \(g\.replay_capture_active && !g\.game_image_valid\)\s*capture_game_image\(runtime, "overlay_fallback"\)/s)
+  assert.match(present, /capture_game_image\(runtime, "present_fallback"\)/)
+  assert.match(present, /last clean point before external overlay addons/)
+  assert.match(overlay, /final fallback/)
+  assert.match(source, /g\.game_image_valid = false;/)
+})
+
+test('game image export is opaque like a regular ReShade screenshot', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const capture = source.match(/bool capture_game_image\([^]*?\n\}/)?.[0] ?? ''
+
+  assert.match(capture, /for \(size_t index = 3; index < g\.game_image\.pixels\.size\(\); index \+= 4\)/)
+  assert.match(capture, /g\.game_image\.pixels\[index\] = 255/)
+})
+
+test('configured water pixel shader is skipped from capture replay only', () => {
+  const source = read('./NS_AlphaCapture.cpp')
+  const config = read('./NS_AlphaCapture.ini')
+  const callback = source.match(/bool on_draw_indexed\([^]*?\n\}/)?.[0] ?? ''
+
+  assert.match(config, /^CaptureExcludePixelShaderHash=0xD24A3428$/m)
+  assert.match(source, /CaptureExcludePixelShaderHash/)
+  assert.match(callback, /g\.replay_capture_active && g\.cfg\.capture_exclude_pixel_shader_hash != 0/)
+  assert.match(callback, /hashes\.pixel == g\.cfg\.capture_exclude_pixel_shader_hash/)
+  assert.match(callback, /capture excluded pixel shader/)
+  assert.match(callback, /return false/)
 })
